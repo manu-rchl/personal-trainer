@@ -6,3 +6,4 @@ data/*.db
 .worktrees/
 data/*.db-shm
 data/*.db-wal
+.gstack/
