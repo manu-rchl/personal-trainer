@@ -1,0 +1,250 @@
+"""Telegram-Bot-Einstiegspunkt für Isa, den Trainer-Agenten.
+
+Start: `uv run python -m trainer.bot.main`
+
+Long Polling, nur die in TELEGRAM_ALLOWED_CHAT_ID konfigurierte Chat-ID wird
+bedient. Textnachrichten gehen an den Tool-Use-Agenten (trainer.agent.core),
+.csv-Uploads werden über den bestehenden Strong-CSV-Importer (Phase 1)
+eingelesen.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import io
+import logging
+import re
+from pathlib import Path
+
+from telegram import Update
+from telegram.constants import ChatAction
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+from trainer.agent.core import run_agent
+from trainer.bot.transcribe import transcribe_ogg
+from trainer.config import config
+from trainer.ingest.strong_csv import import_csv
+
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+TMP_DIR = Path("/private/tmp")
+TELEGRAM_MAX_LEN = 4096
+
+START_MESSAGE = (
+    "Hey, ich bin Isa – dein Trainer & Health-Coach.\n\n"
+    "Ich kann:\n"
+    "- Trainingsfragen beantworten (Übungen, Hypertrophie, Recovery, Ernährung)\n"
+    "- deine Oura- & Health-Daten auswerten (\"Wie war mein Schlaf diese Woche?\")\n"
+    "- Workouts loggen (\"Bankdrücken 3x8 80kg\")\n"
+    "- Strong-CSV-Exporte importieren (Datei einfach hier hochladen)\n\n"
+    "Leg los, schreib mir einfach."
+)
+
+UNAUTHORIZED_MESSAGE = "Dieser Bot ist privat eingerichtet und nicht für dich freigeschaltet."
+
+
+def _is_allowed(chat_id: int) -> bool:
+    allowed = config.telegram_allowed_chat_id
+    return bool(allowed) and str(chat_id) == str(allowed)
+
+
+async def _reject_if_unauthorized(update: Update) -> bool:
+    chat = update.effective_chat
+    if chat is None or _is_allowed(chat.id):
+        return False
+    logger.warning("Unauthorized chat_id=%s versucht Zugriff", chat.id if chat else None)
+    if update.message is not None:
+        await update.message.reply_text(UNAUTHORIZED_MESSAGE)
+    return True
+
+
+async def _send_long_message(update: Update, text: str) -> None:
+    if update.message is None:
+        return
+    if not text:
+        return
+    for i in range(0, len(text), TELEGRAM_MAX_LEN):
+        await update.message.reply_text(text[i : i + TELEGRAM_MAX_LEN])
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _reject_if_unauthorized(update):
+        return
+    if update.message is not None:
+        await update.message.reply_text(START_MESSAGE)
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _reject_if_unauthorized(update):
+        return
+    message = update.message
+    if message is None or not message.text:
+        return
+
+    chat_id = update.effective_chat.id
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+
+    try:
+        reply = await asyncio.to_thread(run_agent, message.text)
+    except Exception as exc:  # niemals crashen, immer eine Antwort schicken
+        logger.exception("run_agent fehlgeschlagen")
+        await message.reply_text(f"Da ist was schiefgelaufen: {exc}")
+        return
+
+    await _send_long_message(update, reply)
+
+
+DEFAULT_PHOTO_CAPTION = "Hier ist ein Foto von meinem Essen."
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _reject_if_unauthorized(update):
+        return
+    message = update.message
+    if message is None or not message.photo:
+        return
+
+    chat_id = update.effective_chat.id
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+
+    photo = message.photo[-1]  # größte verfügbare Auflösung
+    text = message.caption or DEFAULT_PHOTO_CAPTION
+
+    try:
+        tg_file = await context.bot.get_file(photo.file_id)
+        buf = io.BytesIO()
+        await tg_file.download_to_memory(out=buf)
+        image_bytes = buf.getvalue()
+
+        reply = await asyncio.to_thread(
+            run_agent, text, image=("image/jpeg", image_bytes)
+        )
+    except Exception as exc:  # niemals crashen, immer eine Antwort schicken
+        logger.exception("run_agent (Foto) fehlgeschlagen")
+        await message.reply_text(f"Da ist was schiefgelaufen: {exc}")
+        return
+
+    await _send_long_message(update, reply)
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _reject_if_unauthorized(update):
+        return
+    message = update.message
+    voice_or_audio = (message.voice or message.audio) if message is not None else None
+    if message is None or voice_or_audio is None:
+        return
+
+    chat_id = update.effective_chat.id
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+
+    tmp_path = TMP_DIR / f"voice_{voice_or_audio.file_unique_id}.ogg"
+    try:
+        tg_file = await context.bot.get_file(voice_or_audio.file_id)
+        await tg_file.download_to_drive(custom_path=tmp_path)
+        transcript = await asyncio.to_thread(transcribe_ogg, tmp_path)
+    except Exception as exc:  # niemals crashen, immer eine Antwort schicken
+        logger.exception("Transkription fehlgeschlagen")
+        await message.reply_text(f"Da ist was schiefgelaufen bei der Transkription: {exc}")
+        return
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    if not transcript:
+        await message.reply_text(
+            "Ich konnte leider nichts verstehen – kannst du das nochmal sagen oder tippen?"
+        )
+        return
+
+    await message.reply_text(f'🎙 Verstanden: "{transcript}"')
+
+    try:
+        reply = await asyncio.to_thread(
+            run_agent, f"[Sprachnachricht transkribiert] {transcript}"
+        )
+    except Exception as exc:  # niemals crashen, immer eine Antwort schicken
+        logger.exception("run_agent (Voice) fehlgeschlagen")
+        await message.reply_text(f"Da ist was schiefgelaufen: {exc}")
+        return
+
+    await _send_long_message(update, reply)
+
+
+def _parse_import_summary(stdout_text: str) -> str:
+    workouts_m = re.search(r"Workouts importiert:\s*(\d+)", stdout_text)
+    sets_m = re.search(r"S(?:ä|ae)tze importiert:\s*(\d+)", stdout_text)
+    skipped_m = re.search(r"Zeilen übersprungen.*?:\s*(\d+)", stdout_text)
+
+    if workouts_m and sets_m and skipped_m:
+        return (
+            f"{workouts_m.group(1)} Workouts, {sets_m.group(1)} Sätze importiert, "
+            f"{skipped_m.group(1)} Zeilen übersprungen."
+        )
+    # Fallback: rohe Ausgabe des Importers, falls das Format sich mal ändert.
+    return stdout_text.strip() or "Import abgeschlossen (keine Zusammenfassung verfügbar)."
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _reject_if_unauthorized(update):
+        return
+    message = update.message
+    document = message.document if message is not None else None
+    if document is None or not (document.file_name or "").lower().endswith(".csv"):
+        return
+
+    chat_id = update.effective_chat.id
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+
+    tmp_path = TMP_DIR / f"strong_import_{document.file_unique_id}.csv"
+    try:
+        tg_file = await context.bot.get_file(document.file_id)
+        await tg_file.download_to_drive(custom_path=tmp_path)
+
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                import_csv(tmp_path)
+        except SystemExit:
+            # import_csv beendet sich per sys.exit(1) bei fehlenden Pflichtspalten.
+            pass
+
+        summary = _parse_import_summary(buf.getvalue())
+        await message.reply_text(summary)
+    except Exception as exc:
+        logger.exception("CSV-Import fehlgeschlagen")
+        await message.reply_text(f"Da ist was schiefgelaufen beim Import: {exc}")
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def build_application() -> Application:
+    if not config.telegram_bot_token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN ist nicht gesetzt (siehe .env).")
+
+    app = Application.builder().token(config.telegram_bot_token).build()
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    return app
+
+
+def main() -> None:
+    app = build_application()
+    logger.info("Isa-Bot startet (Long Polling)...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
