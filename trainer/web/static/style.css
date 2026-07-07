@@ -270,6 +270,10 @@ input {
   display: flex;
   flex-direction: column;
   gap: 14px;
+  /* Lesbarkeit auf breiten Screens: Chat-Spalte begrenzen und zentrieren */
+  width: 100%;
+  max-width: 900px;
+  margin: 0 auto;
 }
 
 .msg {
@@ -350,10 +354,13 @@ input {
   padding: 16px 24px;
   border-top: 1px solid var(--border);
   background: var(--surface);
+  /* Eingabe an der Chat-Spalte ausrichten (Leiste selbst bleibt full-width) */
+  justify-content: center;
 }
 
 .chat-input {
   flex: 1;
+  max-width: 794px; /* 852px Spalteninhalt minus Senden-Button + gap */
   resize: none;
   background: var(--bg);
   border: 1px solid var(--border);

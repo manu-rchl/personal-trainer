@@ -126,10 +126,18 @@ function selectView(view) {
   el.navHealth.classList.toggle("active", !isChat);
   el.navChat.setAttribute("aria-selected", isChat ? "true" : "false");
   el.navHealth.setAttribute("aria-selected", !isChat ? "true" : "false");
+  // Deep-Linking: Ansicht in der URL abbilden (#chat / #health)
+  if (location.hash !== `#${view}`) history.replaceState(null, "", `#${view}`);
 }
 
 el.navChat.addEventListener("click", () => selectView("chat"));
 el.navHealth.addEventListener("click", () => selectView("health"));
+
+window.addEventListener("hashchange", () => {
+  const view = location.hash === "#health" ? "health" : "chat";
+  if (view !== state.currentView) selectView(view);
+});
+if (location.hash === "#health") selectView("health");
 
 /* ---------------------------------------------------------------------
  * Chat
@@ -297,7 +305,10 @@ function buildPathSegments(values, width, height, padding = 6) {
 
 function drawIn(pathEl) {
   if (REDUCE_MOTION) return;
-  const len = pathEl.getTotalLength();
+  // ×3: wegen vector-effect non-scaling-stroke rechnet die Strichelung in
+  // Bildschirm-Pixeln — auf breiten Screens wäre getTotalLength() (SVG-
+  // Einheiten) zu kurz und die Linie bliebe abgeschnitten.
+  const len = pathEl.getTotalLength() * 3;
   pathEl.style.strokeDasharray = String(len);
   pathEl.style.strokeDashoffset = String(len);
   // Zwei rAF, damit der Browser den Startzustand rendert, bevor die
