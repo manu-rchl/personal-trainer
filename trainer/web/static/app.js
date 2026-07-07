@@ -470,13 +470,19 @@ async function renderDashboard(panel) {
  * View 2/3 — Chat pro Agent
  * --------------------------------------------------------------------- */
 
+/* Markdown-lite: nur **bold** — die Agenten schreiben Telegram-Markdown.
+   Erst escapen, dann ersetzen: kein HTML aus Nachrichteninhalten möglich. */
+function renderInlineMarkdown(text) {
+  return esc(text).replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+}
+
 function renderMessage(msg) {
   const wrap = document.createElement("div");
   const isUser = msg.role === "user";
   wrap.className = "msg " + (isUser ? "msg-user" : "msg-agent");
   const textEl = document.createElement("div");
   textEl.className = "msg-text";
-  textEl.textContent = msg.content;
+  textEl.innerHTML = renderInlineMarkdown(msg.content);
   const tsEl = document.createElement("span");
   tsEl.className = "msg-ts";
   tsEl.textContent = fmtTs(msg.ts);

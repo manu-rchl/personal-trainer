@@ -1170,3 +1170,29 @@ input {
     font-size: 1.05rem;
   }
 }
+
+/* =====================================================================
+   Review-Fixes (Fable)
+   ===================================================================== */
+
+/* display:flex der Klasse würde das hidden-Attribut überstimmen */
+.typing-indicator[hidden] {
+  display: none;
+}
+
+/* Scrollbalken ans Theme anpassen statt weißer System-Balken */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-hover) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--border-hover);
+  border-radius: 4px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
