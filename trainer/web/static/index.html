@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Hub</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link
+  href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@600;700&family=Instrument+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap"
+  rel="stylesheet"
+/>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+
+<header class="pulse-header" id="pulse-header" aria-label="Manuels Vitalwerte, letzte 30 Tage">
+  <svg
+    class="pulse-svg"
+    id="pulse-svg"
+    viewBox="0 0 1000 90"
+    preserveAspectRatio="none"
+    role="img"
+    aria-labelledby="pulse-title"
+  >
+    <title id="pulse-title">HRV-Verlauf der letzten 30 Tage</title>
+    <g id="pulse-glow-group"></g>
+    <g id="pulse-line-group"></g>
+  </svg>
+  <div class="pulse-readouts">
+    <div class="readout">
+      <span class="readout-value" id="readout-hrv">–</span>
+      <span class="readout-label">HRV heute</span>
+    </div>
+    <div class="readout">
+      <span class="readout-value" id="readout-readiness">–</span>
+      <span class="readout-label">Readiness</span>
+    </div>
+    <div class="readout">
+      <span class="readout-value" id="readout-sleep">–</span>
+      <span class="readout-label">Schlaf-Score</span>
+    </div>
+  </div>
+</header>
+
+<div class="layout">
+  <nav class="rail" aria-label="Navigation">
+    <div class="agent-dots" id="agent-dots" role="tablist" aria-label="Agent wählen"></div>
+    <div class="nav-icons" role="tablist" aria-label="Ansicht wählen">
+      <button
+        type="button"
+        class="nav-icon active"
+        id="nav-chat"
+        role="tab"
+        aria-selected="true"
+        aria-controls="view-chat"
+        title="Chat"
+      >
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path
+            d="M4 5.5C4 4.67 4.67 4 5.5 4h13c.83 0 1.5.67 1.5 1.5v10c0 .83-.67 1.5-1.5 1.5H10l-4.5 4v-4H5.5C4.67 16 4 15.33 4 14.5v-9Z"
+            stroke="currentColor"
+            stroke-width="1.6"
+            stroke-linejoin="round"
+          />
+        </svg>
+        <span class="nav-icon-label">Chat</span>
+      </button>
+      <button
+        type="button"
+        class="nav-icon"
+        id="nav-health"
+        role="tab"
+        aria-selected="false"
+        aria-controls="view-health"
+        title="Health"
+      >
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path
+            d="M3 12h4l2-6 4 12 2-8 1.5 2H21"
+            stroke="currentColor"
+            stroke-width="1.6"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+        </svg>
+        <span class="nav-icon-label">Health</span>
+      </button>
+    </div>
+  </nav>
+
+  <main class="content">
+    <section class="view active" id="view-chat" aria-labelledby="nav-chat">
+      <div class="chat-messages" id="chat-messages"></div>
+      <div class="typing-indicator" id="typing-indicator" hidden>
+        <span class="pulse-dot"></span>
+        <span id="typing-label">antwortet …</span>
+      </div>
+      <form class="chat-input-row" id="chat-form">
+        <textarea
+          id="chat-input"
+          class="chat-input"
+          placeholder="Nachricht schreiben …"
+          rows="1"
+          aria-label="Nachricht"
+        ></textarea>
+        <button type="submit" id="chat-send" class="chat-send" aria-label="Senden">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path
+              d="M4 12l16-7-6.5 7L20 19 4 12Z"
+              stroke="currentColor"
+              stroke-width="1.6"
+              stroke-linejoin="round"
+              fill="none"
+            />
+          </svg>
+        </button>
+      </form>
+    </section>
+
+    <section class="view" id="view-health" aria-labelledby="nav-health">
+      <div class="health-grid" id="health-grid">
+        <p class="empty-state">Lade Health-Daten …</p>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

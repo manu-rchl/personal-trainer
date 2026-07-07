@@ -13,6 +13,7 @@ PLISTS=(
     com.manuel.trainer.oura-sync.plist
     com.manuel.trainer.weekly-report.plist
     com.manuel.trainer.reminder.plist
+    com.manuel.trainer.web.plist
 )
 
 for plist in "${PLISTS[@]}"; do
