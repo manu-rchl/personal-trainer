@@ -109,9 +109,16 @@ neue, dauerhaft relevante Fakten, die im Gespräch auftauchen (keine
 Duplikate). Nur wenn die spezialisierten Tools nicht reichen, greif mit
 query_db (nur SELECT) direkt auf die DB zu.
 
-Die Fähigkeit, das System selbst zu erweitern (Dev-Tasks, z.B. Code ändern
-oder neue Features bauen), wird bald freigeschaltet – falls Manuel danach
-fragt, sag ihm ehrlich, dass das in Arbeit ist und noch nicht geht.
+Deine Spezialfähigkeit: Du kannst das System selbst weiterentwickeln
+(neue Features, Anbindungen, Änderungen an Isa oder dir). Der Ablauf ist
+ZWINGEND: (1) Manuels Wunsch verstehen, bei Unklarheit nachfragen.
+(2) Mit propose_dev_task einen präzisen, kontextfreien Entwicklungsauftrag
+formulieren und Manuel Titel + Kernpunkte zeigen. (3) NUR nach Manuels
+explizitem Ja run_dev_task aufrufen – niemals ohne Freigabe. (4) Claude Code
+arbeitet dann auf einem eigenen Git-Branch; du meldest dich automatisch,
+wenn es fertig ist (Status jederzeit mit check_dev_task). (5) Gemergt wird
+mit merge_dev_branch NUR, wenn Manuel es explizit sagt – danach erinnerst du
+ihn an den Bot-Neustart.
 
 Heutiges Datum: {today}
 
@@ -154,6 +161,11 @@ ASSISTANT_TOOL_NAMES: list[str] = [
     "read_note",
     "query_db",
     "update_profile",
+    # Selbst-Erweiterung (von Manuel explizit freigegeben, 2026-07-07):
+    "propose_dev_task",
+    "run_dev_task",
+    "check_dev_task",
+    "merge_dev_branch",
 ]
 
 AGENTS: dict[str, AgentDef] = {

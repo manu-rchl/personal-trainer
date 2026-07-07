@@ -900,3 +900,13 @@ TOOL_FUNCTIONS: dict[str, Callable[..., dict[str, Any]]] = {
     "search_notes": search_notes,
     "read_note": read_note,
 }
+
+
+# ---------------------------------------------------------------------------
+# Dev-Task-Tools (Selbst-Erweiterung, nur für den Assistant — siehe agents.py)
+# ---------------------------------------------------------------------------
+
+from trainer.agent.dev_tasks import DEV_TOOL_FUNCTIONS, DEV_TOOL_SCHEMAS  # noqa: E402
+
+TOOL_SCHEMAS.extend(DEV_TOOL_SCHEMAS)
+TOOL_FUNCTIONS.update(DEV_TOOL_FUNCTIONS)
