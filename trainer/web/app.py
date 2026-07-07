@@ -14,7 +14,7 @@ Start (nur lokal binden!):
 from __future__ import annotations
 
 import asyncio
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +24,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from trainer.agent.core import run_agent
+from trainer.agent.tools import get_calendar, get_meals, get_workouts
 from trainer.agents import AGENTS
+from trainer.config import config
 from trainer.db import get_connection, init_db
 
 app = FastAPI(title="Agent Hub")
@@ -232,6 +234,100 @@ def health_overview(days: int = 30) -> dict[str, Any]:
         }
     finally:
         conn.close()
+
+
+@app.get("/api/overview")
+def overview() -> dict[str, Any]:
+    """Verdichteter Überblick fürs neue Dashboard (Hub-Startseite).
+
+    Bündelt Health-Readouts (neuester Tag mit Daten), den 30-Tage-HRV-Verlauf
+    fürs Puls-Hero, die nächsten Kalender-Termine, die letzten Workouts, die
+    heutige Ernährungs-Summe sowie ein paar System-Kennzahlen (letzter
+    Oura-Sync, DB-Größe). Fehler in Teilbereichen (Kalender nicht erreichbar
+    o.ä.) dürfen den restlichen Überblick nicht blockieren.
+    """
+    ov = health_overview(days=30)
+    daily = ov["daily"]
+    today_data = ov["today"]
+    hrv_series_30d = [{"date": d["date"], "hrv_avg": d["hrv_avg"]} for d in daily]
+
+    try:
+        next_events = (get_calendar(2).get("events") or [])[:5]
+    except Exception:
+        next_events = []
+
+    try:
+        last_workouts = (get_workouts(14).get("workouts") or [])[:3]
+    except Exception:
+        last_workouts = []
+
+    init_db()
+    conn = get_connection()
+    try:
+        today_iso = date.today().isoformat()
+        meal_row = conn.execute(
+            """
+            SELECT COUNT(*) AS n, SUM(protein_g) AS protein_g, SUM(calories_kcal) AS calories_kcal
+            FROM meals
+            WHERE substr(ts, 1, 10) = ?
+            """,
+            (today_iso,),
+        ).fetchone()
+        meals_today = {
+            "protein_g": (
+                _round(meal_row["protein_g"]) if meal_row and meal_row["protein_g"] is not None else 0
+            ),
+            "calories_kcal": (
+                _round(meal_row["calories_kcal"], 0)
+                if meal_row and meal_row["calories_kcal"] is not None
+                else 0
+            ),
+            "count": meal_row["n"] if meal_row and meal_row["n"] is not None else 0,
+        }
+
+        sync_row = conn.execute(
+            "SELECT value FROM sync_state WHERE key = 'oura_last_sync'"
+        ).fetchone()
+    finally:
+        conn.close()
+
+    oura_last_sync: str | None = None
+    if sync_row and sync_row["value"]:
+        try:
+            # sync_state speichert einen Unix-Timestamp als String (str(time.time())).
+            oura_last_sync = datetime.fromtimestamp(float(sync_row["value"])).astimezone().isoformat()
+        except (TypeError, ValueError):
+            oura_last_sync = None
+
+    try:
+        db_size_mb = _round(config.db_path.stat().st_size / (1024 * 1024), 2)
+    except OSError:
+        db_size_mb = None
+
+    return {
+        "today": today_data,
+        "hrv_series_30d": hrv_series_30d,
+        "next_events": next_events,
+        "last_workouts": last_workouts,
+        "meals_today": meals_today,
+        "system": {
+            "oura_last_sync": oura_last_sync,
+            "db_size_mb": db_size_mb,
+            "agents": list(AGENTS.keys()),
+        },
+    }
+
+
+@app.get("/api/workouts")
+def workouts(days: int = 60) -> dict[str, Any]:
+    """Workouts der letzten `days` Tage (Durchreiche von get_workouts)."""
+    return get_workouts(days)
+
+
+@app.get("/api/meals")
+def meals(days: int = 30) -> dict[str, Any]:
+    """Mahlzeiten der letzten `days` Tage (Durchreiche von get_meals)."""
+    return get_meals(days)
 
 
 # Statische Dateien (index.html, style.css, app.js) unter / — MUSS nach den
