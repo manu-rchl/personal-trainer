@@ -40,6 +40,9 @@ class Config:
         default_factory=lambda: _env("TELEGRAM_ALLOWED_CHAT_ID")
     )
 
+    # --- Telegram: zweiter Bot für den "assistant"-Agenten (Multi-Agent) ---
+    assistant_bot_token: str = field(default_factory=lambda: _env("ASSISTANT_BOT_TOKEN"))
+
     # --- Oura OAuth2 ---
     oura_client_id: str = field(default_factory=lambda: _env("OURA_CLIENT_ID"))
     oura_client_secret: str = field(default_factory=lambda: _env("OURA_CLIENT_SECRET"))

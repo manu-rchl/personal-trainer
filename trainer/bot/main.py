@@ -1,20 +1,22 @@
-"""Telegram-Bot-Einstiegspunkt für Isa, den Trainer-Agenten.
+"""Telegram-Bot-Einstiegspunkt für die Trainer-Agenten (Isa, Assistant).
 
-Start: `uv run python -m trainer.bot.main`
+Start: `uv run python -m trainer.bot.main [--agent isa|assistant]` (default: isa)
 
 Long Polling, nur die in TELEGRAM_ALLOWED_CHAT_ID konfigurierte Chat-ID wird
 bedient. Textnachrichten gehen an den Tool-Use-Agenten (trainer.agent.core),
 .csv-Uploads werden über den bestehenden Strong-CSV-Importer (Phase 1)
-eingelesen.
+eingelesen (nur beim Isa-Bot).
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import contextlib
 import io
 import logging
 import re
+import sys
 from pathlib import Path
 
 from telegram import Update
@@ -28,6 +30,7 @@ from telegram.ext import (
 )
 
 from trainer.agent.core import run_agent
+from trainer.agents import AgentDef, get_agent
 from trainer.bot.transcribe import transcribe_ogg
 from trainer.config import config
 from trainer.ingest.strong_csv import import_csv
@@ -40,15 +43,26 @@ logger = logging.getLogger(__name__)
 TMP_DIR = Path("/private/tmp")
 TELEGRAM_MAX_LEN = 4096
 
-START_MESSAGE = (
-    "Hey, ich bin Isa – dein Trainer & Health-Coach.\n\n"
-    "Ich kann:\n"
-    "- Trainingsfragen beantworten (Übungen, Hypertrophie, Recovery, Ernährung)\n"
-    "- deine Oura- & Health-Daten auswerten (\"Wie war mein Schlaf diese Woche?\")\n"
-    "- Workouts loggen (\"Bankdrücken 3x8 80kg\")\n"
-    "- Strong-CSV-Exporte importieren (Datei einfach hier hochladen)\n\n"
-    "Leg los, schreib mir einfach."
-)
+START_MESSAGES: dict[str, str] = {
+    "isa": (
+        "Hey, ich bin Isa – dein Trainer & Health-Coach.\n\n"
+        "Ich kann:\n"
+        "- Trainingsfragen beantworten (Übungen, Hypertrophie, Recovery, Ernährung)\n"
+        "- deine Oura- & Health-Daten auswerten (\"Wie war mein Schlaf diese Woche?\")\n"
+        "- Workouts loggen (\"Bankdrücken 3x8 80kg\")\n"
+        "- Strong-CSV-Exporte importieren (Datei einfach hier hochladen)\n\n"
+        "Leg los, schreib mir einfach."
+    ),
+    "assistant": (
+        "Hey, ich bin dein persönlicher Assistent.\n\n"
+        "Ich kann:\n"
+        "- Fragen zu deinem Kalender, Notizen und Health-Daten beantworten\n"
+        "- proaktiv mitdenken (Termine, offene Punkte, nächste Schritte)\n"
+        "- mir dauerhaft relevante Fakten über dich merken\n\n"
+        "Für Training & Ernährung schreib Isa – ich bin der Rest.\n"
+        "Leg los, schreib mir einfach."
+    ),
+}
 
 UNAUTHORIZED_MESSAGE = "Dieser Bot ist privat eingerichtet und nicht für dich freigeschaltet."
 
@@ -77,11 +91,16 @@ async def _send_long_message(update: Update, text: str) -> None:
         await update.message.reply_text(text[i : i + TELEGRAM_MAX_LEN])
 
 
+def _agent_name(context: ContextTypes.DEFAULT_TYPE) -> str:
+    agent_def: AgentDef = context.bot_data["agent_def"]
+    return agent_def.name
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await _reject_if_unauthorized(update):
         return
     if update.message is not None:
-        await update.message.reply_text(START_MESSAGE)
+        await update.message.reply_text(START_MESSAGES[_agent_name(context)])
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -95,7 +114,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
     try:
-        reply = await asyncio.to_thread(run_agent, message.text)
+        reply = await asyncio.to_thread(run_agent, message.text, None, _agent_name(context))
     except Exception as exc:  # niemals crashen, immer eine Antwort schicken
         logger.exception("run_agent fehlgeschlagen")
         await message.reply_text(f"Da ist was schiefgelaufen: {exc}")
@@ -127,7 +146,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         image_bytes = buf.getvalue()
 
         reply = await asyncio.to_thread(
-            run_agent, text, image=("image/jpeg", image_bytes)
+            run_agent, text, ("image/jpeg", image_bytes), _agent_name(context)
         )
     except Exception as exc:  # niemals crashen, immer eine Antwort schicken
         logger.exception("run_agent (Foto) fehlgeschlagen")
@@ -170,7 +189,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     try:
         reply = await asyncio.to_thread(
-            run_agent, f"[Sprachnachricht transkribiert] {transcript}"
+            run_agent,
+            f"[Sprachnachricht transkribiert] {transcript}",
+            None,
+            _agent_name(context),
         )
     except Exception as exc:  # niemals crashen, immer eine Antwort schicken
         logger.exception("run_agent (Voice) fehlgeschlagen")
@@ -227,22 +249,48 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         tmp_path.unlink(missing_ok=True)
 
 
-def build_application() -> Application:
-    if not config.telegram_bot_token:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN ist nicht gesetzt (siehe .env).")
+def build_application(agent_def: AgentDef) -> Application:
+    if not agent_def.token:
+        raise RuntimeError(
+            f"Kein Bot-Token für Agent '{agent_def.name}' gesetzt "
+            f"(config.{agent_def.token_config_attr}, siehe .env)."
+        )
 
-    app = Application.builder().token(config.telegram_bot_token).build()
+    app = Application.builder().token(agent_def.token).build()
+    app.bot_data["agent_def"] = agent_def
     app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    if agent_def.name == "isa":
+        # CSV-Import (Strong-Export) ist ausschließlich Isas Job.
+        app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     return app
 
 
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Startet einen Trainer-Telegram-Bot.")
+    parser.add_argument(
+        "--agent",
+        choices=["isa", "assistant"],
+        default="isa",
+        help="Welcher Agent bedient diesen Bot (default: isa).",
+    )
+    return parser.parse_args(argv)
+
+
 def main() -> None:
-    app = build_application()
-    logger.info("Isa-Bot startet (Long Polling)...")
+    args = _parse_args()
+    agent_def = get_agent(args.agent)
+
+    try:
+        app = build_application(agent_def)
+    except RuntimeError as exc:
+        logger.error(str(exc))
+        print(f"Fehler: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    logger.info("%s-Bot startet (Long Polling)...", agent_def.display_name)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

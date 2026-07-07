@@ -101,32 +101,50 @@ uv run python -m trainer.ingest.strong_csv pfad/zur/export.csv
 Export in der Strong-App: Settings → Export Strong Data. Import ist deduped
 (SHA256 pro Zeile in `sync_state`) — mehrfacher Import derselben Datei ist safe.
 
-## Telegram-Bot + Trainer-Agent (Isa)
+## Telegram-Bot + Multi-Agent-System (Isa, Assistant)
 
 Der Bot nutzt das offizielle `anthropic`-Python-SDK mit einem selbstgebauten
 Tool-Use-Loop (bewusst kein `claude-agent-sdk`, wegen späterer Portabilität
-auf einen VPS). Tools: `get_health_summary`, `get_workouts`, `log_workout`,
-`query_db` (read-only SELECT), `get_profile`, `update_profile`.
+auf einen VPS). Es gibt zwei Agenten mit je eigenem Telegram-Bot, eigenem
+System-Prompt und eigenem Tool-Subset, definiert in der Registry
+`trainer/agents.py`:
 
-Bot starten (Long Polling, blockiert das Terminal):
+- **Isa** (`isa`) — Trainer & Health-Coach. Tools: `get_health_summary`,
+  `get_workouts`, `log_workout`, `get_meals`, `log_meal`, `query_db`
+  (read-only SELECT), `get_profile`, `update_profile`, `save_memory`,
+  `search_memories`, `get_calendar`, `search_notes`, `read_note`.
+- **Assistant** (`assistant`) — Manuels persönlicher Assistent/Chief of
+  Staff, Generalist für alles außer Training/Ernährung (dafür verweist er an
+  Isa). Dieselben Tools wie Isa, aber **ohne** `log_workout`/`log_meal`.
+
+Beide Agenten haben eine **getrennte Chat-Historie** (Tabelle `messages`,
+Spalte `agent`), teilen sich aber das Langzeit-Gedächtnis (`memories`) — was
+Isa über Manuel lernt, kennt der Assistent auch und umgekehrt.
+
+Bot starten (Long Polling, blockiert das Terminal), Agent per `--agent`-Flag
+wählen (default `isa`):
 
 ```bash
-uv run python -m trainer.bot.main
+uv run python -m trainer.bot.main                    # Isa (default)
+uv run python -m trainer.bot.main --agent assistant   # Assistant
 ```
+
+Für den Assistant-Bot muss `ASSISTANT_BOT_TOKEN` in `.env` gesetzt sein
+(eigener Bot bei @BotFather anlegen) — ohne Token bricht der Start mit einer
+klaren Fehlermeldung ab, statt mit einem Traceback zu crashen.
 
 Funktionen:
 - Nur die in `TELEGRAM_ALLOWED_CHAT_ID` konfigurierte Chat-ID wird bedient,
   alle anderen Chats bekommen eine höfliche Ablehnung.
-- `/start` — kurze Vorstellung, was Isa kann.
-- Textnachrichten — gehen an den Trainer-Agenten (Health-Fragen, Workout-
-  Logging per Chat, allgemeine Trainings-/Ernährungsfragen). Antworten werden
-  bei 4096 Zeichen automatisch gesplittet.
+- `/start` — kurze, agentenspezifische Vorstellung.
+- Textnachrichten — gehen an den jeweiligen Tool-Use-Agenten. Antworten
+  werden bei 4096 Zeichen automatisch gesplittet.
 - `.csv`-Datei-Upload — wird als Strong-Export importiert (nutzt denselben
   Importer wie `trainer.ingest.strong_csv`), Ergebnis-Zusammenfassung kommt
-  als Nachricht zurück.
+  als Nachricht zurück. **Nur beim Isa-Bot registriert.**
 
 `TRAINER_MODEL` (env var, default `claude-sonnet-5`) steuert, welches
-Anthropic-Modell der Agent verwendet.
+Anthropic-Modell beide Agenten verwenden.
 
 ## Automatisierung (Phase 3: geplante Jobs + Autostart)
 
@@ -165,14 +183,19 @@ Anthropic-Modell der Agent verwendet.
 
 ### launchd-Autostart (macOS)
 
-Unter `deploy/` liegen 4 launchd-Agents (Label-Prefix `com.manuel.trainer.*`):
+Unter `deploy/` liegen 5 launchd-Agents (Label-Prefix `com.manuel.trainer.*`):
 
 | Label | Trigger | Kommando |
 |---|---|---|
-| `com.manuel.trainer.bot` | `RunAtLoad` + `KeepAlive` (läuft dauerhaft) | `trainer.bot.main` |
+| `com.manuel.trainer.bot` | `RunAtLoad` + `KeepAlive` (läuft dauerhaft) | `trainer.bot.main` (Isa) |
+| `com.manuel.trainer.assistant` | `RunAtLoad` + `KeepAlive` (läuft dauerhaft) | `trainer.bot.main --agent assistant` |
 | `com.manuel.trainer.oura-sync` | täglich 10:30 | `trainer.ingest.oura sync --days 7` |
 | `com.manuel.trainer.weekly-report` | So. 18:00 | `trainer.jobs.weekly_report` |
 | `com.manuel.trainer.reminder` | täglich 16:30 | `trainer.jobs.reminder_check` |
+
+> `com.manuel.trainer.assistant.plist` ist noch nicht geladen (kein
+> `ASSISTANT_BOT_TOKEN` in `.env` hinterlegt) — sobald der Token gesetzt ist,
+> installiert `install-launchd.sh` ihn wie die anderen Agents.
 
 Alle Agents nutzen den absoluten Pfad zu `uv` (launchd hat kein
 Shell-/PATH-Profil), `WorkingDirectory` = Repo-Root, `EnvironmentVariables`

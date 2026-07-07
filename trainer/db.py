@@ -105,11 +105,25 @@ def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
 
 
 def init_db(db_path: Path | None = None) -> None:
-    """Legt alle Tabellen an (idempotent, CREATE TABLE IF NOT EXISTS)."""
+    """Legt alle Tabellen an (idempotent, CREATE TABLE IF NOT EXISTS).
+
+    Führt danach idempotente Migrationen aus (z.B. neue Spalten auf
+    bestehenden Tabellen), die CREATE TABLE IF NOT EXISTS nicht abdeckt.
+    """
     conn = get_connection(db_path)
     try:
         conn.executescript(SCHEMA)
         conn.commit()
+
+        # Multi-Agent (Phase 5): messages.agent trennt die Chat-Historie pro
+        # Agent (Isa/Assistant). Bestehende Zeilen ohne Agent-Info gelten als
+        # 'isa' (bisher der einzige Agent). ALTER TABLE ADD COLUMN ist in
+        # SQLite nicht idempotent -> try/except statt Existenzprüfung.
+        try:
+            conn.execute("ALTER TABLE messages ADD COLUMN agent TEXT DEFAULT 'isa'")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # Spalte existiert schon
     finally:
         conn.close()
 
