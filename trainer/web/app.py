@@ -14,6 +14,7 @@ Start (nur lokal binden!):
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -331,16 +332,26 @@ def meals(days: int = 30) -> dict[str, Any]:
     return get_meals(days)
 
 
-def _grouped_exercise_points(conn: Any) -> dict[str, list[dict[str, Any]]]:
+def _grouped_exercise_points(
+    conn: Any,
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, str]]:
     """Gruppiert alle Sätze über `canonicalize` und liefert pro kanonischer Übung
-    die chronologische Punkte-Liste (ein Punkt pro Workout-Datum: schwerster Satz).
+    die chronologische Punkte-Liste (ein Punkt pro Workout-Datum: schwerster Satz)
+    sowie die dominante Trainings-Kategorie (workouts.type).
 
     "Schwerster Satz" = höchstes weight_kg, bei Gleichstand die meisten reps.
-    est_1rm nach Epley: weight * (1 + reps/30).
+    est_1rm nach Epley: weight * (1 + reps/30). `set_count` je Punkt zählt alle
+    Sätze dieser Übung am jeweiligen Tag (nicht nur den schwersten).
+
+    Kategorie = Modus von workouts.type über alle Sessions (Workouts), die die
+    Übung enthalten — pro Session (workout_id) genau ein Vote, nicht pro Satz,
+    damit ein Workout mit vielen Sätzen die Kategorie nicht überstimmt. Leerer/
+    NULL type zählt als "Sonstige".
     """
     rows = conn.execute(
         """
-        SELECT w.date AS date, s.exercise AS exercise, s.weight_kg AS weight_kg, s.reps AS reps
+        SELECT w.id AS workout_id, w.date AS date, w.type AS type,
+               s.exercise AS exercise, s.weight_kg AS weight_kg, s.reps AS reps
         FROM workout_sets s
         JOIN workouts w ON s.workout_id = w.id
         WHERE s.exercise IS NOT NULL AND w.date IS NOT NULL AND s.weight_kg IS NOT NULL
@@ -354,8 +365,11 @@ def _grouped_exercise_points(conn: Any) -> dict[str, list[dict[str, Any]]]:
     all_names = [r["exercise"] for r in rows]
     canon_cache: dict[str, str] = {}
 
-    # canonical -> date -> (weight_kg, reps) — nur der schwerste Satz je Tag
-    per_group_per_date: dict[str, dict[str, tuple[float, int | None]]] = {}
+    # canonical -> date -> (weight_kg, reps, set_count) — schwerster Satz + Satzzahl je Tag
+    per_group_per_date: dict[str, dict[str, tuple[float, int | None, int]]] = {}
+    # canonical -> workout_id -> type — ein Vote pro Session, nicht pro Satz
+    category_sessions: dict[str, dict[int, str | None]] = {}
+
     for r in rows:
         raw = r["exercise"]
         canon = canon_cache.get(raw)
@@ -369,14 +383,20 @@ def _grouped_exercise_points(conn: Any) -> dict[str, list[dict[str, Any]]]:
 
         per_date = per_group_per_date.setdefault(canon, {})
         current = per_date.get(d)
-        if current is None or w > current[0] or (w == current[0] and (reps or 0) > (current[1] or 0)):
-            per_date[d] = (w, reps)
+        if current is None:
+            per_date[d] = (w, reps, 1)
+        elif w > current[0] or (w == current[0] and (reps or 0) > (current[1] or 0)):
+            per_date[d] = (w, reps, current[2] + 1)
+        else:
+            per_date[d] = (current[0], current[1], current[2] + 1)
+
+        category_sessions.setdefault(canon, {})[r["workout_id"]] = r["type"]
 
     result: dict[str, list[dict[str, Any]]] = {}
     for canon, per_date in per_group_per_date.items():
         points: list[dict[str, Any]] = []
         for d in sorted(per_date.keys()):
-            w, reps = per_date[d]
+            w, reps, set_count = per_date[d]
             est_1rm = round(w * (1 + (reps or 0) / 30), 1)
             points.append(
                 {
@@ -384,21 +404,31 @@ def _grouped_exercise_points(conn: Any) -> dict[str, list[dict[str, Any]]]:
                     "top_weight_kg": _round(w),
                     "top_reps": reps,
                     "est_1rm": est_1rm,
+                    "set_count": set_count,
                 }
             )
         result[canon] = points
-    return result
+
+    categories: dict[str, str] = {}
+    for canon, sessions in category_sessions.items():
+        counts = Counter(
+            (t.strip() if t and t.strip() else "Sonstige") for t in sessions.values()
+        )
+        categories[canon] = counts.most_common(1)[0][0]
+
+    return result, categories
 
 
 @app.get("/api/exercises")
 def list_exercises() -> list[dict[str, Any]]:
-    """Kanonische Übungen mit Session-Anzahl (Workout-Tage) + letztem Gewicht, sortiert nach
-    Häufigkeit (sessions DESC). Namensvarianten (Strong vs. Hevy) fallen dank `canonicalize`
+    """Kanonische Übungen mit Session-Anzahl (Workout-Tage), letztem Gewicht und
+    dominanter Trainings-Kategorie (workouts.type), sortiert nach Häufigkeit
+    (sessions DESC). Namensvarianten (Strong vs. Hevy) fallen dank `canonicalize`
     zu einer Zeile zusammen."""
     init_db()
     conn = get_connection()
     try:
-        grouped = _grouped_exercise_points(conn)
+        grouped, categories = _grouped_exercise_points(conn)
     finally:
         conn.close()
 
@@ -407,6 +437,7 @@ def list_exercises() -> list[dict[str, Any]]:
             "name": name,
             "sessions": len(points),
             "last_weight_kg": points[-1]["top_weight_kg"] if points else None,
+            "category": categories.get(name, "Sonstige"),
         }
         for name, points in grouped.items()
     ]
@@ -417,12 +448,12 @@ def list_exercises() -> list[dict[str, Any]]:
 @app.get("/api/exercise/progress")
 def exercise_progress(name: str) -> dict[str, Any]:
     """Gewichts-Verlauf einer kanonischen Übung: pro Workout-Datum der schwerste Satz
-    (chronologisch), Varianten via `canonicalize` gemergt. Leere Liste bei unbekannter
-    Übung."""
+    inkl. Satzzahl (chronologisch), Varianten via `canonicalize` gemergt. Leere Liste
+    bei unbekannter Übung."""
     init_db()
     conn = get_connection()
     try:
-        grouped = _grouped_exercise_points(conn)
+        grouped, _categories = _grouped_exercise_points(conn)
     finally:
         conn.close()
 

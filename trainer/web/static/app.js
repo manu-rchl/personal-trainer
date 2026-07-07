@@ -913,15 +913,48 @@ function buildProgressCard(exercises) {
       <svg class="progress-svg" viewBox="0 0 640 200" role="img" aria-label="Gewichtsverlauf der gewählten Übung"></svg>
       <p class="progress-hint" hidden></p>
     </div>
+    <div class="progress-table-wrap" hidden>
+      <h4 class="progress-table-title">Sätze im Verlauf</h4>
+      <div class="progress-table" role="list" aria-label="Sätze im Verlauf, neueste zuerst"></div>
+    </div>
   `;
 
   const selectEl = card.querySelector(".exercise-select");
+
+  // Nach Trainingseinheit (category) gruppieren: Gruppen mit den meisten
+  // Übungen zuerst, "Sonstige" immer zuletzt. Innerhalb einer Gruppe nach
+  // sessions DESC (Eingabe ist bereits global sessions-DESC sortiert, hier
+  // nochmal explizit für Robustheit).
+  const groups = new Map();
   exercises.forEach((ex) => {
-    const opt = document.createElement("option");
-    opt.value = ex.name;
-    opt.textContent = `${ex.name} · ${ex.sessions} Session${ex.sessions === 1 ? "" : "en"}`;
-    selectEl.appendChild(opt);
+    const cat = (ex.category && String(ex.category).trim()) || "Sonstige";
+    if (!groups.has(cat)) groups.set(cat, []);
+    groups.get(cat).push(ex);
   });
+
+  const groupEntries = Array.from(groups.entries());
+  groupEntries.forEach(([, list]) => list.sort((a, b) => b.sessions - a.sessions));
+  groupEntries.sort(([catA, listA], [catB, listB]) => {
+    if (catA === "Sonstige" && catB !== "Sonstige") return 1;
+    if (catB === "Sonstige" && catA !== "Sonstige") return -1;
+    return listB.length - listA.length;
+  });
+
+  groupEntries.forEach(([cat, list]) => {
+    const optgroup = document.createElement("optgroup");
+    optgroup.label = cat;
+    list.forEach((ex) => {
+      const opt = document.createElement("option");
+      opt.value = ex.name;
+      opt.textContent = `${ex.name} · ${ex.sessions} Session${ex.sessions === 1 ? "" : "en"}`;
+      optgroup.appendChild(opt);
+    });
+    selectEl.appendChild(optgroup);
+  });
+
+  // Default bleibt die insgesamt häufigste Übung — nicht zwingend die erste
+  // Option im DOM, sobald optgroups die Reihenfolge verändern.
+  selectEl.value = exercises[0].name;
 
   async function loadProgress(name) {
     let progress;
@@ -947,6 +980,7 @@ function renderProgressGraph(card, progress) {
   const sessionsEl = card.querySelector('[data-field="sessions"]');
   const svg = card.querySelector(".progress-svg");
   const hint = card.querySelector(".progress-hint");
+  const tableWrap = card.querySelector(".progress-table-wrap");
 
   sessionsEl.textContent = String(points.length);
 
@@ -956,6 +990,7 @@ function renderProgressGraph(card, progress) {
     svg.innerHTML = "";
     hint.hidden = false;
     hint.textContent = "Noch keine Daten für diese Übung.";
+    if (tableWrap) tableWrap.hidden = true;
     return;
   }
 
@@ -1010,6 +1045,18 @@ function renderProgressGraph(card, progress) {
   }
 
   coords.forEach((c) => {
+    // Gruppe aus unsichtbarer, größerer Trefferfläche + sichtbarem Punkt —
+    // der r=3.5-Punkt allein wäre auf Touch zu klein zum Antippen.
+    const group = document.createElementNS("http://www.w3.org/2000/svg", "g");
+    group.setAttribute("class", "progress-point");
+
+    const hit = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    hit.setAttribute("cx", c.x.toFixed(2));
+    hit.setAttribute("cy", c.y.toFixed(2));
+    hit.setAttribute("r", "12");
+    hit.setAttribute("class", "progress-dot-hit");
+    group.appendChild(hit);
+
     const dot = document.createElementNS("http://www.w3.org/2000/svg", "circle");
     dot.setAttribute("cx", c.x.toFixed(2));
     dot.setAttribute("cy", c.y.toFixed(2));
@@ -1022,7 +1069,10 @@ function renderProgressGraph(card, progress) {
       1
     )})`;
     dot.appendChild(title);
-    svg.appendChild(dot);
+    group.appendChild(dot);
+
+    group.addEventListener("click", () => highlightProgressRow(card, c.p.date));
+    svg.appendChild(group);
   });
 
   // Achsen: Y min/max, X erstes/letztes Datum — minimalistisch, kein Overkill
@@ -1060,6 +1110,68 @@ function renderProgressGraph(card, progress) {
   } else {
     hint.hidden = true;
   }
+
+  renderProgressTable(card, points);
+}
+
+/* Kompakte Liste unter dem Graphen — neueste Session zuerst. Delta bezieht
+   sich immer auf die zeitlich VORHERIGE (ältere) Session, auch wenn die
+   Liste selbst rückwärts sortiert ist. */
+function renderProgressTable(card, points) {
+  const wrap = card.querySelector(".progress-table-wrap");
+  const tableEl = card.querySelector(".progress-table");
+  if (!wrap || !tableEl) return;
+
+  tableEl.innerHTML = "";
+
+  if (!points.length) {
+    wrap.hidden = true;
+    return;
+  }
+  wrap.hidden = false;
+
+  for (let i = points.length - 1; i >= 0; i--) {
+    const p = points[i];
+    const prev = i > 0 ? points[i - 1] : null;
+
+    const row = document.createElement("div");
+    row.className = "progress-table-row";
+    row.setAttribute("role", "listitem");
+    row.dataset.date = p.date;
+
+    let deltaHtml = '<span class="progress-delta progress-delta-none">–</span>';
+    if (prev && prev.top_weight_kg != null && p.top_weight_kg != null) {
+      const diff = Math.round((p.top_weight_kg - prev.top_weight_kg) * 10) / 10;
+      if (diff > 0) {
+        deltaHtml = `<span class="progress-delta progress-delta-up">↑ +${fmtNum(diff, 1)} kg</span>`;
+      } else if (diff < 0) {
+        deltaHtml = `<span class="progress-delta progress-delta-down">↓ −${fmtNum(
+          Math.abs(diff),
+          1
+        )} kg</span>`;
+      } else {
+        deltaHtml = '<span class="progress-delta progress-delta-flat">→</span>';
+      }
+    }
+
+    const repsLabel = p.top_reps != null ? p.top_reps : "–";
+    row.innerHTML = `
+      <span class="progress-table-date">${esc(fmtDate(p.date))}</span>
+      <span class="progress-table-top">${fmtNum(p.top_weight_kg, 1)} kg × ${esc(String(repsLabel))}</span>
+      <span class="progress-table-sets">${p.set_count != null ? p.set_count : "–"} Sätze</span>
+      <span class="progress-table-e1rm">e1RM ${fmtNum(p.est_1rm, 1)}</span>
+      ${deltaHtml}
+    `;
+    tableEl.appendChild(row);
+  }
+}
+
+/* Tap auf einen Graph-Punkt hebt die zugehörige Tabellenzeile kurz hervor. */
+function highlightProgressRow(card, dateIso) {
+  const rows = card.querySelectorAll(".progress-table-row");
+  rows.forEach((r) => {
+    r.classList.toggle("highlighted", r.dataset.date === dateIso);
+  });
 }
 
 async function renderTraining(panel) {
