@@ -4,3 +4,5 @@ __pycache__/
 data/*.db
 .venv/
 .worktrees/
+data/*.db-shm
+data/*.db-wal
