@@ -760,6 +760,137 @@ input {
 }
 
 /* =====================================================================
+   Training — Fortschritts-Modul
+   ===================================================================== */
+
+.progress-card {
+  margin-bottom: 20px;
+}
+
+.progress-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+
+.progress-head .card-title {
+  margin: 0;
+}
+
+.select-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.exercise-select {
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 11px 34px 11px 12px;
+  min-height: 44px;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  max-width: min(320px, 60vw);
+  cursor: pointer;
+  transition: border-color 150ms var(--ease-out);
+}
+
+.exercise-select:hover {
+  border-color: var(--border-hover);
+}
+
+.exercise-select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.select-chevron {
+  position: absolute;
+  right: 11px;
+  width: 14px;
+  height: 14px;
+  color: var(--text-dim);
+  pointer-events: none;
+}
+
+.progress-readouts {
+  display: flex;
+  gap: 32px;
+  margin-bottom: 6px;
+  flex-wrap: wrap;
+}
+
+.progress-readout-value {
+  color: var(--ok);
+}
+
+.progress-graph-wrap {
+  margin-top: 10px;
+}
+
+.progress-svg {
+  width: 100%;
+  height: 200px;
+  display: block;
+}
+
+.progress-grid line {
+  stroke: var(--border);
+  stroke-width: 1;
+  opacity: 0.6;
+}
+
+.progress-line {
+  fill: none;
+  stroke: var(--isa);
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+  transition: stroke-dashoffset 1s var(--ease-out);
+}
+
+.progress-dot {
+  fill: var(--surface);
+  stroke: var(--isa);
+  stroke-width: 1.6;
+  vector-effect: non-scaling-stroke;
+}
+
+.progress-axis-label {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  fill: var(--text-dim);
+}
+
+.progress-axis-label-end {
+  text-anchor: end;
+}
+
+.progress-hint {
+  margin: 10px 0 0;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+
+.section-heading {
+  font-family: var(--font-display);
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--text-dim);
+  margin: 22px 0 10px;
+}
+
+/* =====================================================================
    Training
    ===================================================================== */
 
@@ -1071,6 +1202,7 @@ input {
 @media (prefers-reduced-motion: reduce) {
   .pulse-line,
   .pulse-glow,
+  .progress-line,
   .msg,
   .pulse-dot,
   .brand-dot,

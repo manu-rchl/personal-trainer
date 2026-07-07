@@ -87,6 +87,11 @@ CREATE TABLE IF NOT EXISTS memories (
     category TEXT,
     content TEXT
 );
+
+CREATE TABLE IF NOT EXISTS exercise_aliases (
+    alias TEXT PRIMARY KEY,
+    canonical TEXT NOT NULL
+);
 """
 
 

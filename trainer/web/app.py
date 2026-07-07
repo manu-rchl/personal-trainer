@@ -28,6 +28,7 @@ from trainer.agent.tools import get_calendar, get_meals, get_workouts
 from trainer.agents import AGENTS
 from trainer.config import config
 from trainer.db import get_connection, init_db
+from trainer.exercise_norm import canonicalize
 
 app = FastAPI(title="Agent Hub")
 
@@ -328,6 +329,104 @@ def workouts(days: int = 60) -> dict[str, Any]:
 def meals(days: int = 30) -> dict[str, Any]:
     """Mahlzeiten der letzten `days` Tage (Durchreiche von get_meals)."""
     return get_meals(days)
+
+
+def _grouped_exercise_points(conn: Any) -> dict[str, list[dict[str, Any]]]:
+    """Gruppiert alle Sätze über `canonicalize` und liefert pro kanonischer Übung
+    die chronologische Punkte-Liste (ein Punkt pro Workout-Datum: schwerster Satz).
+
+    "Schwerster Satz" = höchstes weight_kg, bei Gleichstand die meisten reps.
+    est_1rm nach Epley: weight * (1 + reps/30).
+    """
+    rows = conn.execute(
+        """
+        SELECT w.date AS date, s.exercise AS exercise, s.weight_kg AS weight_kg, s.reps AS reps
+        FROM workout_sets s
+        JOIN workouts w ON s.workout_id = w.id
+        WHERE s.exercise IS NOT NULL AND w.date IS NOT NULL AND s.weight_kg IS NOT NULL
+        ORDER BY w.date
+        """
+    ).fetchall()
+
+    alias_rows = conn.execute("SELECT alias, canonical FROM exercise_aliases").fetchall()
+    alias_map = {r["alias"]: r["canonical"] for r in alias_rows}
+
+    all_names = [r["exercise"] for r in rows]
+    canon_cache: dict[str, str] = {}
+
+    # canonical -> date -> (weight_kg, reps) — nur der schwerste Satz je Tag
+    per_group_per_date: dict[str, dict[str, tuple[float, int | None]]] = {}
+    for r in rows:
+        raw = r["exercise"]
+        canon = canon_cache.get(raw)
+        if canon is None:
+            canon = canonicalize(raw, all_names, alias_map)
+            canon_cache[raw] = canon
+
+        d = str(r["date"])[:10]
+        w = float(r["weight_kg"])
+        reps = r["reps"]
+
+        per_date = per_group_per_date.setdefault(canon, {})
+        current = per_date.get(d)
+        if current is None or w > current[0] or (w == current[0] and (reps or 0) > (current[1] or 0)):
+            per_date[d] = (w, reps)
+
+    result: dict[str, list[dict[str, Any]]] = {}
+    for canon, per_date in per_group_per_date.items():
+        points: list[dict[str, Any]] = []
+        for d in sorted(per_date.keys()):
+            w, reps = per_date[d]
+            est_1rm = round(w * (1 + (reps or 0) / 30), 1)
+            points.append(
+                {
+                    "date": d,
+                    "top_weight_kg": _round(w),
+                    "top_reps": reps,
+                    "est_1rm": est_1rm,
+                }
+            )
+        result[canon] = points
+    return result
+
+
+@app.get("/api/exercises")
+def list_exercises() -> list[dict[str, Any]]:
+    """Kanonische Übungen mit Session-Anzahl (Workout-Tage) + letztem Gewicht, sortiert nach
+    Häufigkeit (sessions DESC). Namensvarianten (Strong vs. Hevy) fallen dank `canonicalize`
+    zu einer Zeile zusammen."""
+    init_db()
+    conn = get_connection()
+    try:
+        grouped = _grouped_exercise_points(conn)
+    finally:
+        conn.close()
+
+    items = [
+        {
+            "name": name,
+            "sessions": len(points),
+            "last_weight_kg": points[-1]["top_weight_kg"] if points else None,
+        }
+        for name, points in grouped.items()
+    ]
+    items.sort(key=lambda x: x["sessions"], reverse=True)
+    return items
+
+
+@app.get("/api/exercise/progress")
+def exercise_progress(name: str) -> dict[str, Any]:
+    """Gewichts-Verlauf einer kanonischen Übung: pro Workout-Datum der schwerste Satz
+    (chronologisch), Varianten via `canonicalize` gemergt. Leere Liste bei unbekannter
+    Übung."""
+    init_db()
+    conn = get_connection()
+    try:
+        grouped = _grouped_exercise_points(conn)
+    finally:
+        conn.close()
+
+    return {"name": name, "points": grouped.get(name, [])}
 
 
 # Statische Dateien (index.html, style.css, app.js) unter / — MUSS nach den

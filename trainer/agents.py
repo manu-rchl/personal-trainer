@@ -146,6 +146,7 @@ ISA_TOOL_NAMES: list[str] = [
     "get_calendar",
     "search_notes",
     "read_note",
+    "merge_exercises",
 ]
 
 # Bewusst KEIN log_workout/log_meal — das ist Isas Job, siehe System-Prompt.
@@ -161,6 +162,7 @@ ASSISTANT_TOOL_NAMES: list[str] = [
     "read_note",
     "query_db",
     "update_profile",
+    "merge_exercises",
     # Selbst-Erweiterung (von Manuel explizit freigegeben, 2026-07-07):
     "propose_dev_task",
     "run_dev_task",

@@ -871,27 +871,232 @@ function workoutRow(w) {
   return row;
 }
 
+/* --- Fortschritts-Modul: Übungswahl + Gewichts-Verlaufsgraph --- */
+
+function buildProgressCard(exercises) {
+  const card = document.createElement("section");
+  card.className = "card progress-card stagger";
+
+  if (!exercises || exercises.length === 0) {
+    card.innerHTML = `
+      <h3 class="card-title">Fortschritt</h3>
+      <p class="empty-state">Noch keine Übungen geloggt — sag's Isa oder logge dein erstes Workout.</p>
+    `;
+    return card;
+  }
+
+  card.innerHTML = `
+    <div class="progress-head">
+      <h3 class="card-title">Fortschritt</h3>
+      <div class="select-wrap">
+        <select class="exercise-select" aria-label="Übung wählen"></select>
+        <svg class="select-chevron" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+      </div>
+    </div>
+    <div class="progress-readouts">
+      <div class="readout">
+        <span class="readout-value progress-readout-value" data-field="current">–</span>
+        <span class="readout-label">Aktuell</span>
+      </div>
+      <div class="readout">
+        <span class="readout-value progress-readout-value" data-field="max">–</span>
+        <span class="readout-label">Max</span>
+      </div>
+      <div class="readout">
+        <span class="readout-value progress-readout-value" data-field="sessions">–</span>
+        <span class="readout-label">Sessions</span>
+      </div>
+    </div>
+    <div class="progress-graph-wrap">
+      <svg class="progress-svg" viewBox="0 0 640 200" role="img" aria-label="Gewichtsverlauf der gewählten Übung"></svg>
+      <p class="progress-hint" hidden></p>
+    </div>
+  `;
+
+  const selectEl = card.querySelector(".exercise-select");
+  exercises.forEach((ex) => {
+    const opt = document.createElement("option");
+    opt.value = ex.name;
+    opt.textContent = `${ex.name} · ${ex.sessions} Session${ex.sessions === 1 ? "" : "en"}`;
+    selectEl.appendChild(opt);
+  });
+
+  async function loadProgress(name) {
+    let progress;
+    try {
+      progress = await fetchJson(`/api/exercise/progress?name=${encodeURIComponent(name)}`);
+    } catch {
+      return;
+    }
+    if (!document.body.contains(card)) return; // View gewechselt
+    renderProgressGraph(card, progress);
+  }
+
+  selectEl.addEventListener("change", () => loadProgress(selectEl.value));
+  loadProgress(exercises[0].name);
+
+  return card;
+}
+
+function renderProgressGraph(card, progress) {
+  const points = progress.points || [];
+  const currentEl = card.querySelector('[data-field="current"]');
+  const maxEl = card.querySelector('[data-field="max"]');
+  const sessionsEl = card.querySelector('[data-field="sessions"]');
+  const svg = card.querySelector(".progress-svg");
+  const hint = card.querySelector(".progress-hint");
+
+  sessionsEl.textContent = String(points.length);
+
+  if (points.length === 0) {
+    currentEl.textContent = "–";
+    maxEl.textContent = "–";
+    svg.innerHTML = "";
+    hint.hidden = false;
+    hint.textContent = "Noch keine Daten für diese Übung.";
+    return;
+  }
+
+  const weights = points.map((p) => p.top_weight_kg);
+  const current = points[points.length - 1].top_weight_kg;
+  const max = Math.max(...weights);
+  currentEl.textContent = `${fmtNum(current, 1)} kg`;
+  maxEl.textContent = `${fmtNum(max, 1)} kg`;
+
+  const width = 640;
+  const height = 200;
+  const padding = 28;
+  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  svg.innerHTML = "";
+
+  const lo = Math.min(...weights);
+  const hi = Math.max(...weights);
+  const range = hi - lo || 1;
+  const n = points.length;
+  const stepX = n > 1 ? (width - padding * 2) / (n - 1) : 0;
+  const usableH = height - padding * 2;
+
+  const coords = points.map((p, i) => ({
+    x: padding + i * stepX,
+    y: padding + (1 - (p.top_weight_kg - lo) / range) * usableH,
+    p,
+  }));
+
+  // Dezente horizontale Gridlines
+  const gridGroup = document.createElementNS("http://www.w3.org/2000/svg", "g");
+  gridGroup.setAttribute("class", "progress-grid");
+  [0, 0.5, 1].forEach((f) => {
+    const y = padding + f * usableH;
+    const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    line.setAttribute("x1", padding.toFixed(2));
+    line.setAttribute("x2", (width - padding).toFixed(2));
+    line.setAttribute("y1", y.toFixed(2));
+    line.setAttribute("y2", y.toFixed(2));
+    gridGroup.appendChild(line);
+  });
+  svg.appendChild(gridGroup);
+
+  if (n > 1) {
+    const d = coords
+      .map((c, i) => `${i === 0 ? "M" : "L"}${c.x.toFixed(2)},${c.y.toFixed(2)}`)
+      .join(" ");
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", d);
+    path.setAttribute("class", "progress-line");
+    svg.appendChild(path);
+    drawIn(path);
+  }
+
+  coords.forEach((c) => {
+    const dot = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    dot.setAttribute("cx", c.x.toFixed(2));
+    dot.setAttribute("cy", c.y.toFixed(2));
+    dot.setAttribute("r", "3.5");
+    dot.setAttribute("class", "progress-dot");
+    const title = document.createElementNS("http://www.w3.org/2000/svg", "title");
+    const repsLabel = c.p.top_reps != null ? c.p.top_reps : "–";
+    title.textContent = `${fmtDate(c.p.date)} · ${fmtNum(c.p.top_weight_kg, 1)} kg × ${repsLabel} (e1RM ${fmtNum(
+      c.p.est_1rm,
+      1
+    )})`;
+    dot.appendChild(title);
+    svg.appendChild(dot);
+  });
+
+  // Achsen: Y min/max, X erstes/letztes Datum — minimalistisch, kein Overkill
+  const yMinLabel = document.createElementNS("http://www.w3.org/2000/svg", "text");
+  yMinLabel.setAttribute("x", "4");
+  yMinLabel.setAttribute("y", (height - padding + 4).toFixed(2));
+  yMinLabel.setAttribute("class", "progress-axis-label");
+  yMinLabel.textContent = `${fmtNum(lo, 0)} kg`;
+  svg.appendChild(yMinLabel);
+
+  const yMaxLabel = document.createElementNS("http://www.w3.org/2000/svg", "text");
+  yMaxLabel.setAttribute("x", "4");
+  yMaxLabel.setAttribute("y", (padding - 8).toFixed(2));
+  yMaxLabel.setAttribute("class", "progress-axis-label");
+  yMaxLabel.textContent = `${fmtNum(hi, 0)} kg`;
+  svg.appendChild(yMaxLabel);
+
+  const xFirstLabel = document.createElementNS("http://www.w3.org/2000/svg", "text");
+  xFirstLabel.setAttribute("x", padding.toFixed(2));
+  xFirstLabel.setAttribute("y", (height - 6).toFixed(2));
+  xFirstLabel.setAttribute("class", "progress-axis-label");
+  xFirstLabel.textContent = fmtDate(points[0].date);
+  svg.appendChild(xFirstLabel);
+
+  const xLastLabel = document.createElementNS("http://www.w3.org/2000/svg", "text");
+  xLastLabel.setAttribute("x", (width - padding).toFixed(2));
+  xLastLabel.setAttribute("y", (height - 6).toFixed(2));
+  xLastLabel.setAttribute("class", "progress-axis-label progress-axis-label-end");
+  xLastLabel.textContent = fmtDate(points[points.length - 1].date);
+  svg.appendChild(xLastLabel);
+
+  if (n === 1) {
+    hint.hidden = false;
+    hint.textContent = "Mehr Sessions = Trendlinie";
+  } else {
+    hint.hidden = true;
+  }
+}
+
 async function renderTraining(panel) {
   panel.innerHTML = '<p class="empty-state">Lade Workouts …</p>';
   let data;
+  let exercises;
   try {
-    data = await fetchJson("/api/workouts?days=60");
+    [data, exercises] = await Promise.all([
+      fetchJson("/api/workouts?days=60"),
+      fetchJson("/api/exercises"),
+    ]);
   } catch {
     panel.innerHTML = '<p class="empty-state">Workouts konnten nicht geladen werden.</p>';
     return;
   }
   if (state.route !== "#/training") return;
 
+  panel.innerHTML = "";
+  panel.appendChild(buildProgressCard(exercises));
+
   const workouts = data.workouts || [];
   if (workouts.length === 0) {
-    panel.innerHTML = `<p class="empty-state">In den letzten 60 Tagen ist nichts geloggt.
-      <span class="empty-state-hint">Sag Isa im Chat, was du trainiert hast — oder importiere ein Strong-CSV.</span></p>`;
+    const empty = document.createElement("p");
+    empty.className = "empty-state";
+    empty.innerHTML = `In den letzten 60 Tagen ist nichts geloggt.
+      <span class="empty-state-hint">Sag Isa im Chat, was du trainiert hast — oder importiere ein Strong-CSV.</span>`;
+    panel.appendChild(empty);
     return;
   }
 
+  const heading = document.createElement("h3");
+  heading.className = "section-heading stagger";
+  heading.textContent = "Verlauf";
+  panel.appendChild(heading);
+
   const list = document.createElement("div");
   list.className = "workout-list";
-  panel.innerHTML = "";
   panel.appendChild(list);
 
   workouts.forEach((w) => {

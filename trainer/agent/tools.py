@@ -20,6 +20,7 @@ from icalendar import Calendar
 
 from trainer.config import config
 from trainer.db import get_connection, init_db
+from trainer.exercise_norm import normalize_name
 
 # ---------------------------------------------------------------------------
 # Hilfsfunktionen
@@ -621,6 +622,39 @@ def read_note(file: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# merge_exercises (manueller Override für die Übungs-Namens-Normalisierung)
+# ---------------------------------------------------------------------------
+
+
+def merge_exercises(from_name: str, into_name: str) -> dict[str, Any]:
+    """Ordnet `from_name` manuell `into_name` zu (exercise_aliases-Override).
+
+    Überschreibt einen bestehenden Eintrag für denselben (normalisierten)
+    `from_name`, falls vorhanden.
+    """
+    init_db()
+    alias = normalize_name(from_name)
+    conn = get_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO exercise_aliases (alias, canonical) VALUES (?, ?)
+            ON CONFLICT(alias) DO UPDATE SET canonical = excluded.canonical
+            """,
+            (alias, into_name),
+        )
+        conn.commit()
+        return {
+            "from_name": from_name,
+            "alias": alias,
+            "into_name": into_name,
+            "status": "gespeichert",
+        }
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Anthropic tool-use Schema
 # ---------------------------------------------------------------------------
 
@@ -883,6 +917,30 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "required": ["file"],
         },
     },
+    {
+        "name": "merge_exercises",
+        "description": (
+            "Fasst zwei Übungsnamen zusammen, z.B. wenn dieselbe Übung durch "
+            "App-Wechsel unterschiedlich heißt (Strong vs. Hevy). Danach fällt "
+            "`from_name` im Trainings-Verlauf und im Fortschritts-Graph unter "
+            "`into_name`. Nutzen, wenn Manuel eine automatische Gruppierung "
+            "korrigieren will oder zwei Übungen manuell zusammenlegen möchte."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "from_name": {
+                    "type": "string",
+                    "description": "Der Übungsname, der zusammengefasst werden soll.",
+                },
+                "into_name": {
+                    "type": "string",
+                    "description": "Der Ziel-Übungsname (kanonisch), unter dem beide fortan erscheinen.",
+                },
+            },
+            "required": ["from_name", "into_name"],
+        },
+    },
 ]
 
 TOOL_FUNCTIONS: dict[str, Callable[..., dict[str, Any]]] = {
@@ -899,6 +957,7 @@ TOOL_FUNCTIONS: dict[str, Callable[..., dict[str, Any]]] = {
     "get_calendar": get_calendar,
     "search_notes": search_notes,
     "read_note": read_note,
+    "merge_exercises": merge_exercises,
 }
 
 
