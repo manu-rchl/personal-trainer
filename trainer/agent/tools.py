@@ -784,17 +784,24 @@ def _build_hevy_routine_payload(
         matched.append(
             {"name": name, "matched_title": best["title"], "template_id": best["id"]}
         )
-        payload_exercises.append(
-            {
-                "exercise_template_id": best["id"],
-                "sets": [
-                    {"type": "normal", "reps": reps, "weight_kg": None}
-                    for _ in range(max(sets, 1))
-                ],
-            }
-        )
+        exercise_payload: dict[str, Any] = {
+            "exercise_template_id": best["id"],
+            "sets": [
+                {"type": "normal", "reps": reps, "weight_kg": None}
+                for _ in range(max(sets, 1))
+            ],
+        }
+        rest_seconds = ex.get("rest_seconds")
+        if rest_seconds is not None:
+            exercise_payload["rest_seconds"] = rest_seconds
+        payload_exercises.append(exercise_payload)
 
-    payload = {"routine": {"title": title, "exercises": payload_exercises}}
+    # folder_id MUSS explizit gesendet werden — Hevy lehnt POST /v1/routines
+    # sonst mit 400 "Invalid routine folder id: undefined" ab. `null` legt die
+    # Routine im Standard-Ordner "My Routines" an (siehe Hevy-OpenAPI-Doku).
+    payload = {
+        "routine": {"title": title, "folder_id": None, "exercises": payload_exercises}
+    }
     return payload, matched, unmatched
 
 
@@ -847,7 +854,13 @@ def create_hevy_routine(title: str, exercises: list[dict[str, Any]]) -> dict[str
         return {"error": f"Hevy-API-Fehler beim Erstellen der Routine: {exc}"}
 
     data = resp.json()
-    routine_id = data.get("id") or (data.get("routine") or {}).get("id")
+    # Live beobachtet: Hevy liefert "routine" als Array mit einem Element
+    # zurück, nicht als einzelnes Objekt (weicht von der eigenen OpenAPI-Doku
+    # ab, die ein plain object dokumentiert) — beide Formen abfangen.
+    routine_obj: dict[str, Any] = data.get("routine") or {}
+    if isinstance(routine_obj, list):
+        routine_obj = routine_obj[0] if routine_obj else {}
+    routine_id = data.get("id") or routine_obj.get("id")
 
     return {
         "routine_id": routine_id,
