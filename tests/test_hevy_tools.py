@@ -8,7 +8,10 @@ werden, um die Routine in den Standard-Ordner "My Routines" zu legen.
 
 import sqlite3
 
-from trainer.agent.tools import _build_hevy_routine_payload
+import pytest
+
+import trainer.agent.tools as tools_module
+from trainer.agent.tools import _build_hevy_routine_payload, create_hevy_routine
 
 
 def _conn_with_templates() -> sqlite3.Connection:
@@ -75,3 +78,50 @@ def test_routine_payload_matches_exercise_and_builds_sets():
     assert exercise["exercise_template_id"] == "3BC06AD3"
     assert len(exercise["sets"]) == 2
     assert exercise["sets"][0] == {"type": "normal", "reps": 10, "weight_kg": None}
+
+
+class _FakeResponse:
+    """Minimaler httpx.Response-Stand-in mit der echten, live beobachteten
+    Hevy-Response-Form: `routine` ist ein Array mit einem Element, nicht ein
+    einzelnes Objekt (weicht von Hevys eigener OpenAPI-Doku ab)."""
+
+    def __init__(self, payload: dict) -> None:
+        self._payload = payload
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict:
+        return self._payload
+
+
+def test_create_hevy_routine_parses_real_response_shape(monkeypatch):
+    """Live gegen die echte Hevy-API beobachtete 201-Response:
+    {"routine": [{"id": "...", ...}]} — `routine` als Liste, nicht als Objekt.
+    """
+    monkeypatch.setattr(tools_module, "init_db", lambda: None)
+    monkeypatch.setattr(tools_module, "get_connection", lambda: _conn_with_templates())
+    if not tools_module.config.hevy_api_key:
+        pytest.skip("HEVY_API_KEY nicht gesetzt — Config ist frozen, kann in Tests nicht gepatcht werden")
+
+    fake_response = _FakeResponse(
+        {
+            "routine": [
+                {
+                    "id": "970690f1-575b-4f2f-8b56-fcec73c11658",
+                    "title": "Test Routine",
+                    "folder_id": None,
+                    "exercises": [],
+                }
+            ]
+        }
+    )
+    monkeypatch.setattr(
+        tools_module.httpx, "post", lambda *a, **kw: fake_response
+    )
+
+    result = create_hevy_routine(
+        "Test Routine", [{"name": "Bicep Curl", "sets": 1, "reps": 10}]
+    )
+
+    assert result["routine_id"] == "970690f1-575b-4f2f-8b56-fcec73c11658"
