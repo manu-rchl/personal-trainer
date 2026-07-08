@@ -21,6 +21,7 @@ from icalendar import Calendar
 from trainer.config import config
 from trainer.db import get_connection, init_db
 from trainer.exercise_norm import normalize_name
+from trainer.ingest import hevy as hevy_ingest
 
 # ---------------------------------------------------------------------------
 # Hilfsfunktionen
@@ -655,6 +656,207 @@ def merge_exercises(from_name: str, into_name: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Hevy-Integration: Sofort-Sync, Übungs-Suche, Routinen-Erstellung
+# ---------------------------------------------------------------------------
+
+MAX_HEVY_EXERCISE_RESULTS = 15
+# Jaccard-Ähnlichkeit (Token-Overlap) der normalisierten Namen, ab der ein
+# Fuzzy-Match akzeptiert wird. Bewusst konservativ — lieber "unmatched"
+# zurückgeben, als eine falsche Übung in eine Routine zu schreiben.
+HEVY_MATCH_MIN_SCORE = 0.5
+
+
+def sync_hevy_now() -> dict[str, Any]:
+    """Synchronisiert sofort die neuesten Hevy-Workouts (kein Backfill).
+
+    Für "hab grad in Hevy trainiert, zieh's rein" — holt nur die ersten Seiten
+    (neueste Workouts), nicht die komplette Historie.
+    """
+    if not config.hevy_api_key:
+        return {"error": "Hevy ist nicht konfiguriert (HEVY_API_KEY fehlt)."}
+    try:
+        result = hevy_ingest.sync(full=False)
+    except Exception as exc:  # Netzwerk-/API-Fehler nicht crashen lassen
+        return {"error": f"Hevy-Sync fehlgeschlagen: {exc}"}
+    return {
+        "workouts_new": result["inserted"],
+        "workouts_updated": result["updated"],
+    }
+
+
+def search_hevy_exercises(query: str) -> dict[str, Any]:
+    """Durchsucht den gecachten Hevy-Übungskatalog per Fuzzy-Teilstring-Suche.
+
+    Vergleicht normalisierte Namen (siehe `normalize_name`), damit Groß-/
+    Kleinschreibung und Satzzeichen keine Rolle spielen. Liefert max. 15
+    Treffer ({id, title, primary_muscle}).
+    """
+    init_db()
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT id, title, primary_muscle FROM hevy_exercise_templates"
+        ).fetchall()
+        if not rows:
+            return {
+                "error": (
+                    "Der Hevy-Übungs-Katalog ist noch nicht gecached. Erst "
+                    "`python -m trainer.ingest.hevy templates` ausführen."
+                )
+            }
+
+        norm_query = normalize_name(query)
+        matches = [
+            dict(r) for r in rows if norm_query in normalize_name(r["title"] or "")
+        ]
+        matches.sort(key=lambda m: len(m["title"] or ""))
+        results = matches[:MAX_HEVY_EXERCISE_RESULTS]
+        return {"query": query, "result_count": len(results), "results": results}
+    finally:
+        conn.close()
+
+
+def _best_hevy_template_match(
+    name: str, templates: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    """Fuzzy-Match eines freien Übungsnamens gegen den Template-Katalog.
+
+    Exakter Treffer (normalisiert) gewinnt sofort. Sonst Jaccard-Token-Overlap
+    der normalisierten Namen; unterhalb `HEVY_MATCH_MIN_SCORE` gilt der Name
+    als ungematcht (wird NICHT geraten).
+    """
+    norm_name = normalize_name(name)
+    name_tokens = set(norm_name.split())
+    if not name_tokens:
+        return None
+
+    best: dict[str, Any] | None = None
+    best_score = 0.0
+    for t in templates:
+        norm_title = normalize_name(t.get("title") or "")
+        if norm_title == norm_name:
+            return t
+        title_tokens = set(norm_title.split())
+        if not title_tokens:
+            continue
+        overlap = name_tokens & title_tokens
+        if not overlap:
+            continue
+        score = len(overlap) / len(name_tokens | title_tokens)
+        if score > best_score:
+            best_score = score
+            best = t
+
+    if best is not None and best_score >= HEVY_MATCH_MIN_SCORE:
+        return best
+    return None
+
+
+def _build_hevy_routine_payload(
+    conn: sqlite3.Connection, title: str, exercises: list[dict[str, Any]]
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[str]]:
+    """Baut den POST-Payload für /v1/routines + Match-/Unmatch-Listen.
+
+    Reine Funktion ohne Netzwerk-Aufruf — separat testbar (Dry-Run) und von
+    `create_hevy_routine` genutzt.
+    """
+    templates = [
+        dict(r)
+        for r in conn.execute(
+            "SELECT id, title, primary_muscle FROM hevy_exercise_templates"
+        ).fetchall()
+    ]
+
+    matched: list[dict[str, Any]] = []
+    unmatched: list[str] = []
+    payload_exercises: list[dict[str, Any]] = []
+
+    for ex in exercises:
+        name = ex.get("name", "")
+        sets = int(ex.get("sets") or 1)
+        reps = ex.get("reps")
+
+        best = _best_hevy_template_match(name, templates)
+        if best is None:
+            unmatched.append(name)
+            continue
+
+        matched.append(
+            {"name": name, "matched_title": best["title"], "template_id": best["id"]}
+        )
+        payload_exercises.append(
+            {
+                "exercise_template_id": best["id"],
+                "sets": [
+                    {"type": "normal", "reps": reps, "weight_kg": None}
+                    for _ in range(max(sets, 1))
+                ],
+            }
+        )
+
+    payload = {"routine": {"title": title, "exercises": payload_exercises}}
+    return payload, matched, unmatched
+
+
+def create_hevy_routine(title: str, exercises: list[dict[str, Any]]) -> dict[str, Any]:
+    """Erstellt eine neue Hevy-Routine aus einer Liste von Übungen.
+
+    `exercises`: Liste von {name, sets, reps, rest_seconds?}. Jeder Name wird
+    per Fuzzy-Match (normalisierte Token-Überlappung) gegen den gecachten
+    Hevy-Übungskatalog (`search_hevy_exercises`/`cache_templates`) aufgelöst.
+    NICHT gematchte Namen werden NICHT geraten, sondern als "unmatched"
+    zurückgegeben, damit Isa beim Nutzer nachfragen kann. Bei Erfolg wird die
+    Routine live in Manuels Hevy-Account angelegt (POST /v1/routines).
+    """
+    if not config.hevy_api_key:
+        return {"error": "Hevy ist nicht konfiguriert (HEVY_API_KEY fehlt)."}
+
+    init_db()
+    conn = get_connection()
+    try:
+        template_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM hevy_exercise_templates"
+        ).fetchone()["n"]
+        if template_count == 0:
+            return {
+                "error": (
+                    "Der Hevy-Übungs-Katalog ist noch nicht gecached. Erst "
+                    "`python -m trainer.ingest.hevy templates` ausführen."
+                )
+            }
+
+        payload, matched, unmatched = _build_hevy_routine_payload(conn, title, exercises)
+    finally:
+        conn.close()
+
+    if not matched:
+        return {
+            "error": "Keine der angegebenen Übungen konnte gematcht werden.",
+            "unmatched": unmatched,
+        }
+
+    try:
+        resp = httpx.post(
+            f"{hevy_ingest.API_BASE}/v1/routines",
+            headers={"api-key": config.hevy_api_key, "Content-Type": "application/json"},
+            json=payload,
+            timeout=30,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        return {"error": f"Hevy-API-Fehler beim Erstellen der Routine: {exc}"}
+
+    data = resp.json()
+    routine_id = data.get("id") or (data.get("routine") or {}).get("id")
+
+    return {
+        "routine_id": routine_id,
+        "matched": matched,
+        "unmatched": unmatched,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Anthropic tool-use Schema
 # ---------------------------------------------------------------------------
 
@@ -941,6 +1143,73 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "required": ["from_name", "into_name"],
         },
     },
+    {
+        "name": "sync_hevy_now",
+        "description": (
+            "Synchronisiert sofort die neuesten Workouts aus Hevy (nicht die "
+            "komplette Historie). Nutzen, wenn Manuel sagt, er hat gerade in "
+            "Hevy trainiert und die Daten sollen sofort ins System."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "search_hevy_exercises",
+        "description": (
+            "Durchsucht den gecachten Hevy-Übungskatalog per Fuzzy-Suche "
+            "(Teilstring, normalisiert) und liefert max. 15 Treffer mit "
+            "{id, title, primary_muscle}. Nutzen, um vor create_hevy_routine "
+            "zu prüfen, welche Übungen es in Hevy gibt bzw. wie sie heißen."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Suchbegriff, z.B. 'bench' oder 'kniebeuge'.",
+                }
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "create_hevy_routine",
+        "description": (
+            "Erstellt eine neue Trainings-Routine direkt in Manuels Hevy-App. "
+            "Jede angegebene Übung wird per Fuzzy-Match gegen den Hevy-"
+            "Übungskatalog aufgelöst; nicht eindeutig zuordenbare Übungen "
+            "werden als 'unmatched' zurückgegeben statt geraten — dann bei "
+            "Manuel nachfragen, statt selbst zu entscheiden. Schreibt live "
+            "in Hevy, also nur nach klarer Absicht/Bestätigung von Manuel "
+            "aufrufen."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Name der Routine."},
+                "exercises": {
+                    "type": "array",
+                    "description": "Liste der Übungen in der Routine.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Übungsname (wird gegen Hevy-Katalog gematcht).",
+                            },
+                            "sets": {"type": "integer", "description": "Anzahl Sätze."},
+                            "reps": {"type": "integer", "description": "Ziel-Wiederholungen pro Satz."},
+                            "rest_seconds": {
+                                "type": "integer",
+                                "description": "Optionale Satzpause in Sekunden.",
+                            },
+                        },
+                        "required": ["name", "sets"],
+                    },
+                },
+            },
+            "required": ["title", "exercises"],
+        },
+    },
 ]
 
 TOOL_FUNCTIONS: dict[str, Callable[..., dict[str, Any]]] = {
@@ -958,6 +1227,9 @@ TOOL_FUNCTIONS: dict[str, Callable[..., dict[str, Any]]] = {
     "search_notes": search_notes,
     "read_note": read_note,
     "merge_exercises": merge_exercises,
+    "sync_hevy_now": sync_hevy_now,
+    "search_hevy_exercises": search_hevy_exercises,
+    "create_hevy_routine": create_hevy_routine,
 }
 
 

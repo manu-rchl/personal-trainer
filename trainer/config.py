@@ -47,6 +47,9 @@ class Config:
     oura_client_id: str = field(default_factory=lambda: _env("OURA_CLIENT_ID"))
     oura_client_secret: str = field(default_factory=lambda: _env("OURA_CLIENT_SECRET"))
 
+    # --- Hevy (Workout-Tracking, ersetzt Strong) ---
+    hevy_api_key: str = field(default_factory=lambda: _env("HEVY_API_KEY"))
+
     # --- Health Auto Export Webhook ---
     health_webhook_secret: str = field(
         default_factory=lambda: _env("HEALTH_WEBHOOK_SECRET")

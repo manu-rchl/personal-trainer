@@ -18,8 +18,10 @@ DB_SCHEMA_OVERVIEW = """
 - oura_daily(date, kind, payload_json, sleep_score, readiness_score, activity_score,
   hrv_avg, resting_hr, sleep_duration_min, steps) — PRIMARY KEY (date, kind)
 - health_metrics(source, metric, ts, value, unit) — generische Apple-Health-Datenpunkte
-- workouts(id, date, type, source, notes) — source ist 'strong_csv', 'chat' oder 'apple_health'
+- workouts(id, date, type, source, notes, ext_id) — source ist 'hevy', 'chat', 'strong_csv'
+  (Altbestand) oder 'apple_health'; ext_id ist die native Hevy-Workout-ID (Dedupe)
 - workout_sets(workout_id, exercise, set_no, reps, weight_kg)
+- hevy_exercise_templates(id, title, primary_muscle, equipment) — gecachter Hevy-Übungskatalog
 - profile(key, value) — Ziele, Gewicht, Präferenzen
 - messages(id, ts, role, content, agent) — Chat-Historie, getrennt pro Agent
 - sync_state(key, value) — interne Sync-Metadaten (nicht relevant für Trainer-Fragen)
@@ -147,6 +149,9 @@ ISA_TOOL_NAMES: list[str] = [
     "search_notes",
     "read_note",
     "merge_exercises",
+    "sync_hevy_now",
+    "search_hevy_exercises",
+    "create_hevy_routine",
 ]
 
 # Bewusst KEIN log_workout/log_meal — das ist Isas Job, siehe System-Prompt.

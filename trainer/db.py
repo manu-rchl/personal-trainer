@@ -92,6 +92,13 @@ CREATE TABLE IF NOT EXISTS exercise_aliases (
     alias TEXT PRIMARY KEY,
     canonical TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS hevy_exercise_templates (
+    id TEXT PRIMARY KEY,
+    title TEXT,
+    primary_muscle TEXT,
+    equipment TEXT
+);
 """
 
 
@@ -126,6 +133,14 @@ def init_db(db_path: Path | None = None) -> None:
         # SQLite nicht idempotent -> try/except statt Existenzprüfung.
         try:
             conn.execute("ALTER TABLE messages ADD COLUMN agent TEXT DEFAULT 'isa'")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # Spalte existiert schon
+
+        # Hevy-Integration: ext_id hält die native Hevy-Workout-ID für Dedupe
+        # (UPSERT über ext_id statt Neuanlage bei jedem Sync).
+        try:
+            conn.execute("ALTER TABLE workouts ADD COLUMN ext_id TEXT")
             conn.commit()
         except sqlite3.OperationalError:
             pass  # Spalte existiert schon
