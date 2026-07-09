@@ -4,10 +4,22 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Hub</title>
+<script>
+  // Vor dem ersten Paint setzen, sonst blitzt beim Laden kurz das falsche
+  // Theme auf (localStorage-Lesen nach CSS-Parse wäre zu spät).
+  (function () {
+    try {
+      var t = localStorage.getItem("hub-theme");
+      document.documentElement.dataset.theme = t === "light" ? "light" : "dark";
+    } catch (e) {
+      document.documentElement.dataset.theme = "dark";
+    }
+  })();
+</script>
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link
-  href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@600;700&family=Instrument+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap"
+  href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@500;600;700;800&family=Instrument+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap"
   rel="stylesheet"
 />
 <link rel="stylesheet" href="/style.css" />
@@ -15,99 +27,103 @@
 <body>
 
 <div class="shell">
-  <nav class="sidebar" aria-label="Navigation">
-    <div class="sidebar-brand">
-      <span class="brand-dot" aria-hidden="true"></span>
-      <span class="brand-word">Hub</span>
+  <aside class="sidebar" aria-label="Navigation">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">H</span>
+      <span class="brand-name">Hub</span>
+    </div>
+    <div class="brand-tagline">Manuels persönliches Betriebssystem</div>
+
+    <div class="nav-block">
+      <span class="eyebrow">Bereiche</span>
+      <div class="domain-item active"><span class="domain-dot"></span>Fitness</div>
+      <button class="domain-item locked" disabled type="button">
+        <span class="domain-dot"></span>Finance<span class="domain-soon">bald</span>
+      </button>
+      <button class="domain-item locked" disabled type="button">
+        <span class="domain-dot"></span>Arbeit<span class="domain-soon">bald</span>
+      </button>
+      <button class="domain-item locked" disabled type="button">
+        <span class="domain-dot"></span>Zuhause<span class="domain-soon">bald</span>
+      </button>
     </div>
 
-    <div class="sidebar-nav" id="sidebar-nav">
-      <div class="nav-section">
-        <div class="nav-label">Übersicht</div>
-        <a class="nav-item" href="#/" data-hash="#/">
-          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-            <rect x="3.5" y="3.5" width="7.5" height="7.5" rx="1.6" stroke="currentColor" stroke-width="1.5" />
-            <rect x="13" y="3.5" width="7.5" height="7.5" rx="1.6" stroke="currentColor" stroke-width="1.5" />
-            <rect x="3.5" y="13" width="7.5" height="7.5" rx="1.6" stroke="currentColor" stroke-width="1.5" />
-            <rect x="13" y="13" width="7.5" height="7.5" rx="1.6" stroke="currentColor" stroke-width="1.5" />
-          </svg>
-          <span>Dashboard</span>
-        </a>
-      </div>
-
-      <div class="nav-section">
-        <div class="nav-label">Agenten</div>
-        <a class="nav-item" href="#/chat/isa" data-hash="#/chat/isa">
-          <span class="agent-bullet" style="--dot-color: var(--isa)" aria-hidden="true"></span>
-          <span>Isa</span>
-        </a>
-        <a class="nav-item" href="#/chat/assistant" data-hash="#/chat/assistant">
-          <span class="agent-bullet" style="--dot-color: var(--assistant)" aria-hidden="true"></span>
-          <span>Assistant</span>
-        </a>
-      </div>
-
-      <div class="nav-section">
-        <div class="nav-label">Daten</div>
-        <a class="nav-item" href="#/health" data-hash="#/health">
-          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-            <path
-              d="M3 12h4l2-6 4 12 2-8 1.5 2H21"
-              stroke="currentColor"
-              stroke-width="1.5"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-            />
-          </svg>
-          <span>Health</span>
-        </a>
-        <a class="nav-item" href="#/training" data-hash="#/training">
-          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-            <path
-              d="M6.5 9v6M4 10v4M17.5 9v6M20 10v4M8.5 12h7"
-              stroke="currentColor"
-              stroke-width="1.5"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-            />
-            <rect x="5.2" y="8.2" width="2.6" height="7.6" rx="1" stroke="currentColor" stroke-width="1.5" />
-            <rect x="16.2" y="8.2" width="2.6" height="7.6" rx="1" stroke="currentColor" stroke-width="1.5" />
-          </svg>
-          <span>Training</span>
-        </a>
-        <a class="nav-item" href="#/ernaehrung" data-hash="#/ernaehrung">
-          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-            <path
-              d="M7 3v7a2 2 0 0 0 2 2v9M7 3v6M9 3v6M7 10V3M16.5 3c-1.4 0-2.5 2-2.5 5s1.1 5 2.5 5V21"
-              stroke="currentColor"
-              stroke-width="1.5"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-            />
-          </svg>
-          <span>Ernährung</span>
-        </a>
-      </div>
-
-      <div class="nav-indicator" id="nav-indicator" aria-hidden="true"></div>
+    <div class="nav-block" id="sidebar-nav">
+      <span class="eyebrow">Fitness</span>
+      <a class="section-item" href="#/" data-hash="#/">
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <rect x="3.5" y="3.5" width="7" height="7" rx="1.6" stroke="currentColor" />
+          <rect x="13.5" y="3.5" width="7" height="7" rx="1.6" stroke="currentColor" />
+          <rect x="3.5" y="13.5" width="7" height="7" rx="1.6" stroke="currentColor" />
+          <rect x="13.5" y="13.5" width="7" height="7" rx="1.6" stroke="currentColor" />
+        </svg>
+        <span class="label">Overview</span>
+        <span class="idx">00</span>
+      </a>
+      <a class="section-item" href="#/health" data-hash="#/health">
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M3 12h4l2-6 4 12 2-8 1.5 2H21" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+        <span class="label">Health</span>
+        <span class="idx">01</span>
+      </a>
+      <a class="section-item" href="#/training" data-hash="#/training">
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M6.5 9v6M4 10v4M17.5 9v6M20 10v4M8.5 12h7" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+        <span class="label">Training</span>
+        <span class="idx">02</span>
+      </a>
+      <a class="section-item" href="#/ernaehrung" data-hash="#/ernaehrung">
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M7 3v7a2 2 0 0 0 2 2v9M7 3v6M9 3v6M7 10V3M16.5 3c-1.4 0-2.5 2-2.5 5s1.1 5 2.5 5V21" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+        <span class="label">Ernährung</span>
+        <span class="idx">03</span>
+      </a>
     </div>
 
-    <div class="sidebar-footer" id="sidebar-footer">
-      <span class="status-dot" id="status-dot"></span>
-      <div class="footer-text">
-        <span class="footer-status" id="footer-status">Verbinde …</span>
-        <span id="footer-sync">Sync: –</span>
-        <span id="footer-db">DB: –</span>
+    <div class="nav-block">
+      <span class="eyebrow">Agenten</span>
+      <a class="agent-item" href="#/chat/isa" data-hash="#/chat/isa">
+        <span class="agent-avatar" style="background: var(--accent)">I</span>
+        <span class="agent-item-text">
+          <span class="agent-item-name">Isa</span>
+          <span class="agent-item-sub">Fitness & Ernährung</span>
+        </span>
+      </a>
+      <a class="agent-item" href="#/chat/assistant" data-hash="#/chat/assistant">
+        <span class="agent-avatar" style="background: var(--assistant)">A</span>
+        <span class="agent-item-text">
+          <span class="agent-item-name">Assistant</span>
+          <span class="agent-item-sub">Chief of Staff</span>
+        </span>
+      </a>
+    </div>
+
+    <div class="sidebar-spacer"></div>
+
+    <div class="sidebar-footer">
+      <div class="theme-toggle">
+        <span class="theme-toggle-label" id="theme-toggle-label">Dunkles Design</span>
+        <button class="switch" id="theme-toggle" type="button" role="switch" aria-checked="false" aria-label="Theme wechseln">
+          <span class="switch-knob"></span>
+        </button>
+      </div>
+      <div class="status-row">
+        <span class="status-dot" id="status-dot"></span>
+        <span id="footer-status-text">Verbinde …</span>
       </div>
     </div>
-  </nav>
+  </aside>
 
   <main class="main">
-    <header class="view-header">
+    <header class="topbar">
+      <span class="eyebrow" id="view-eyebrow"></span>
       <h1 id="view-title">Dashboard</h1>
-      <p class="view-subtitle" id="view-subtitle"></p>
+      <p id="view-subtitle"></p>
     </header>
-    <div class="view-container" id="view-container">
+    <div class="viewport" id="view-container">
       <p class="empty-state">Lade …</p>
     </div>
   </main>
@@ -123,7 +139,7 @@
       <span class="tab-label">Dashboard</span>
     </a>
     <a class="tab-item" href="#/chat/isa" data-hash="#/chat/isa">
-      <span class="agent-bullet" style="--dot-color: var(--isa)" aria-hidden="true"></span>
+      <span class="agent-bullet" style="--dot-color: var(--accent)" aria-hidden="true"></span>
       <span class="tab-label">Isa</span>
     </a>
     <a class="tab-item" href="#/chat/assistant" data-hash="#/chat/assistant">
