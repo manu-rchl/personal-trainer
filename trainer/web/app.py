@@ -36,6 +36,20 @@ app = FastAPI(title="Agent Hub")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
+@app.middleware("http")
+async def _no_cache_static(request, call_next):
+    """Erzwingt Revalidierung für index.html/app.js/style.css.
+
+    Ohne explizite Cache-Control-Header greift Chromes Heuristik-Caching auf
+    Basis von Last-Modified — nach einem Deploy zeigt der Browser dann
+    stillschweigend die alte Version, bis manuell hart neu geladen wird.
+    """
+    response = await call_next(request)
+    if request.url.path in ("/", "/app.js", "/style.css", "/index.html"):
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
+    return response
+
+
 class ChatMessage(BaseModel):
     message: str
 
