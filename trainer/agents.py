@@ -75,6 +75,19 @@ kannst Gym-Slots passend um Arbeit/Termine herum vorschlagen. Mit search_notes
 und read_note kannst du in Manuels persönlichen Notizen (Obsidian) suchen,
 wenn es hilft, ihn zu verstehen oder Fragen zu beantworten.
 
+Der Obsidian-Vault ist Manuels "zweites Gehirn" — du hast dort auch
+Schreibzugriff (create_note/append_note/edit_note/delete_note) und sollst ihn
+PROAKTIV pflegen, ohne dass Manuel dich explizit dazu auffordern muss: Wenn im
+Gespräch strukturiertes, über eine einzelne Fakten-Notiz hinausgehendes Wissen
+entsteht (z.B. eine durchdachte Trainingsstrategie, eine Recherche, ein
+zusammenhängendes Thema), leg dafür eine Notiz an oder erweitere eine
+bestehende — nach kurzer search_notes-Prüfung auf Duplikate. Halte den Vault
+aktuell: veraltete oder überholte Aussagen in bestehenden Notizen mit
+edit_note korrigieren statt stehen zu lassen; eindeutig obsolete Notizen mit
+delete_note entfernen (im Zweifel lieber fragen als löschen). save_memory
+bleibt für kurze, einzelne Fakten über Manuel (geteilt mit "assistant");
+Notizen sind für zusammenhängendes, strukturiertes Wissen.
+
 DB-Schema (SQLite):
 {schema}
 """
@@ -102,6 +115,18 @@ geteilte Langzeit-Gedächtnis über Manuel zu – speichere dort unaufgefordert
 neue, dauerhaft relevante Fakten, die im Gespräch auftauchen (keine
 Duplikate). Nur wenn die spezialisierten Tools nicht reichen, greif mit
 query_db (nur SELECT) direkt auf die DB zu.
+
+Der Obsidian-Vault ist Manuels "zweites Gehirn" – du hast dort auch
+Schreibzugriff (create_note/append_note/edit_note/delete_note) und sollst ihn
+PROAKTIV pflegen, ohne dass Manuel dich explizit dazu auffordern muss: Wenn im
+Gespräch strukturiertes, über eine einzelne Fakten-Notiz hinausgehendes Wissen
+entsteht (Projekt-Kontext, Entscheidungen, Recherchen, zusammenhängende
+Themen), leg dafür eine Notiz an oder erweitere eine bestehende – nach kurzer
+search_notes-Prüfung auf Duplikate. Halte den Vault aktuell: veraltete oder
+überholte Aussagen in bestehenden Notizen mit edit_note korrigieren statt
+stehen zu lassen; eindeutig obsolete Notizen mit delete_note entfernen (im
+Zweifel lieber fragen als löschen). save_memory bleibt für kurze, einzelne
+Fakten über Manuel; Notizen sind für zusammenhängendes, strukturiertes Wissen.
 
 Deine Spezialfähigkeit: Du kannst das System selbst weiterentwickeln
 (neue Features, Anbindungen, Änderungen an Isa oder dir). Der Ablauf ist
@@ -143,6 +168,10 @@ ISA_TOOL_NAMES: list[str] = [
     "get_calendar",
     "search_notes",
     "read_note",
+    "create_note",
+    "append_note",
+    "edit_note",
+    "delete_note",
     "merge_exercises",
     "sync_hevy_now",
     "search_hevy_exercises",
@@ -164,6 +193,10 @@ ASSISTANT_TOOL_NAMES: list[str] = [
     "save_memory",
     "search_notes",
     "read_note",
+    "create_note",
+    "append_note",
+    "edit_note",
+    "delete_note",
     "query_db",
     "update_profile",
     "merge_exercises",

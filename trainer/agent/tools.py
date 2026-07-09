@@ -626,6 +626,145 @@ def read_note(file: str) -> dict[str, Any]:
     }
 
 
+def _resolve_vault_note_path(vault: Path, file: str) -> Path | str:
+    """Löst `file` gegen den Vault auf und validiert ihn für Schreibzugriffe.
+
+    Gibt den aufgelösten Path zurück, oder einen String mit Fehlermeldung.
+    Teilt sich die Pfad-Traversal-Logik mit `read_note`, plus zusätzlich:
+    nur `.md`-Dateien, nicht innerhalb `.obsidian`/`.trash`.
+    """
+    candidate = (vault / file).resolve()
+    if candidate != vault and vault not in candidate.parents:
+        return "Ungültiger Dateipfad (außerhalb des Vaults)."
+    if candidate.suffix.lower() != ".md":
+        return "Nur .md-Dateien sind erlaubt."
+    try:
+        relative_parts = candidate.relative_to(vault).parts
+    except ValueError:
+        return "Ungültiger Dateipfad (außerhalb des Vaults)."
+    if any(part in _OBSIDIAN_EXCLUDED_DIRS for part in relative_parts):
+        return "Pfad liegt in einem geschützten Vault-Ordner (.obsidian/.trash)."
+    return candidate
+
+
+def create_note(file: str, content: str) -> dict[str, Any]:
+    """Legt eine NEUE Markdown-Notiz im Obsidian-Vault an.
+
+    Schlägt bewusst fehl, wenn die Datei schon existiert (kein versehentliches
+    Überschreiben) — für Updates an bestehenden Notizen `edit_note` oder
+    `append_note` nutzen. Erstellt fehlende Zwischenordner automatisch.
+    """
+    vault = _obsidian_vault_root()
+    if vault is None:
+        return {"error": "Kein gültiger Obsidian-Vault konfiguriert (OBSIDIAN_VAULT_PATH fehlt oder ungültig)"}
+
+    resolved = _resolve_vault_note_path(vault, file)
+    if isinstance(resolved, str):
+        return {"error": resolved}
+    if resolved.exists():
+        return {
+            "error": f"Datei existiert bereits: {file} — edit_note oder append_note nutzen."
+        }
+
+    try:
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        resolved.write_text(content, encoding="utf-8")
+    except OSError as exc:
+        return {"error": f"Notiz konnte nicht angelegt werden: {exc}"}
+
+    return {"file": file, "created": True}
+
+
+def append_note(file: str, content: str) -> dict[str, Any]:
+    """Hängt Text an eine Notiz an (erstellt sie, falls sie noch nicht existiert).
+
+    Für laufende Logs/Journale geeignet. Fügt einen Zeilenumbruch vor dem
+    neuen Inhalt ein, falls die Datei nicht leer ist und nicht bereits mit
+    einem Zeilenumbruch endet.
+    """
+    vault = _obsidian_vault_root()
+    if vault is None:
+        return {"error": "Kein gültiger Obsidian-Vault konfiguriert (OBSIDIAN_VAULT_PATH fehlt oder ungültig)"}
+
+    resolved = _resolve_vault_note_path(vault, file)
+    if isinstance(resolved, str):
+        return {"error": resolved}
+
+    try:
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        existing = resolved.read_text(encoding="utf-8") if resolved.exists() else ""
+        separator = "\n" if existing and not existing.endswith("\n") else ""
+        resolved.write_text(existing + separator + content, encoding="utf-8")
+    except OSError as exc:
+        return {"error": f"Notiz konnte nicht ergänzt werden: {exc}"}
+
+    return {"file": file, "appended": True}
+
+
+def edit_note(file: str, old_text: str, new_text: str) -> dict[str, Any]:
+    """Ersetzt einen exakten Textabschnitt in einer bestehenden Notiz.
+
+    Wie das str_replace-Pattern des text_editor-Tools: `old_text` muss GENAU
+    EINMAL in der Datei vorkommen, sonst Fehler statt einer geratenen Änderung
+    (0 Treffer = Text nicht gefunden, >1 Treffer = mehrdeutig — mehr Kontext
+    in old_text angeben). Sicherer als vollständiges Überschreiben, weil kein
+    anderer Teil der Notiz versehentlich verloren gehen kann.
+    """
+    vault = _obsidian_vault_root()
+    if vault is None:
+        return {"error": "Kein gültiger Obsidian-Vault konfiguriert (OBSIDIAN_VAULT_PATH fehlt oder ungültig)"}
+
+    resolved = _resolve_vault_note_path(vault, file)
+    if isinstance(resolved, str):
+        return {"error": resolved}
+    if not resolved.is_file():
+        return {"error": f"Datei nicht gefunden: {file}"}
+
+    try:
+        text = resolved.read_text(encoding="utf-8")
+    except OSError as exc:
+        return {"error": f"Notiz konnte nicht gelesen werden: {exc}"}
+
+    count = text.count(old_text)
+    if count == 0:
+        return {"error": "old_text wurde nicht in der Datei gefunden."}
+    if count > 1:
+        return {
+            "error": (
+                f"old_text kommt {count}x vor, muss aber eindeutig sein — "
+                "mehr umgebenden Kontext in old_text angeben."
+            )
+        }
+
+    try:
+        resolved.write_text(text.replace(old_text, new_text, 1), encoding="utf-8")
+    except OSError as exc:
+        return {"error": f"Notiz konnte nicht geändert werden: {exc}"}
+
+    return {"file": file, "edited": True}
+
+
+def delete_note(file: str) -> dict[str, Any]:
+    """Löscht eine Notiz endgültig aus dem Vault (z.B. um veraltete/überholte
+    Inhalte im Sinne eines gepflegten Langzeit-Gedächtnisses zu entfernen)."""
+    vault = _obsidian_vault_root()
+    if vault is None:
+        return {"error": "Kein gültiger Obsidian-Vault konfiguriert (OBSIDIAN_VAULT_PATH fehlt oder ungültig)"}
+
+    resolved = _resolve_vault_note_path(vault, file)
+    if isinstance(resolved, str):
+        return {"error": resolved}
+    if not resolved.is_file():
+        return {"error": f"Datei nicht gefunden: {file}"}
+
+    try:
+        resolved.unlink()
+    except OSError as exc:
+        return {"error": f"Notiz konnte nicht gelöscht werden: {exc}"}
+
+    return {"file": file, "deleted": True}
+
+
 # ---------------------------------------------------------------------------
 # merge_exercises (manueller Override für die Übungs-Namens-Normalisierung)
 # ---------------------------------------------------------------------------
@@ -1370,9 +1509,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "search_notes",
         "description": (
-            "Durchsucht Manuels persönliche Notizen (Obsidian-Vault, read-only) "
-            "per Volltextsuche. Hilfreich, um Manuel besser zu verstehen oder "
-            "Fragen zu seinen Notizen zu beantworten. Max. 10 Treffer mit Ausschnitt."
+            "Durchsucht Manuels persönliche Notizen (Obsidian-Vault) per "
+            "Volltextsuche. Hilfreich, um Manuel besser zu verstehen, Fragen zu "
+            "seinen Notizen zu beantworten, oder bevor create_note/edit_note "
+            "genutzt wird um zu prüfen, ob zu einem Thema schon eine Notiz "
+            "existiert. Max. 10 Treffer mit Ausschnitt."
         ),
         "input_schema": {
             "type": "object",
@@ -1397,6 +1538,100 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "file": {
                     "type": "string",
                     "description": "Relativer Dateipfad innerhalb des Vaults.",
+                }
+            },
+            "required": ["file"],
+        },
+    },
+    {
+        "name": "create_note",
+        "description": (
+            "Legt eine NEUE Notiz im Obsidian-Vault an (Manuels 'zweites Gehirn'). "
+            "Proaktiv nutzen, wenn im Gespräch dauerhaft relevantes Wissen "
+            "entsteht, das über eine einzelne Memory-Notiz hinausgeht — "
+            "strukturierte Themen-Notizen, Zusammenfassungen, Recherche-Ergebnisse. "
+            "Vorher search_notes nutzen, um Duplikate zu vermeiden. Schlägt fehl, "
+            "wenn die Datei schon existiert (dann edit_note/append_note nutzen)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file": {
+                    "type": "string",
+                    "description": "Relativer Pfad innerhalb des Vaults, z.B. 'Trainer/Recovery-Notizen.md'.",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Vollständiger Markdown-Inhalt der neuen Notiz.",
+                },
+            },
+            "required": ["file", "content"],
+        },
+    },
+    {
+        "name": "append_note",
+        "description": (
+            "Hängt Text an eine Notiz im Obsidian-Vault an (erstellt sie bei "
+            "Bedarf). Für laufende Logs/Journal-Einträge — z.B. eine tägliche "
+            "Notiz oder eine fortlaufende Liste."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file": {
+                    "type": "string",
+                    "description": "Relativer Pfad innerhalb des Vaults.",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Anzuhängender Text.",
+                },
+            },
+            "required": ["file", "content"],
+        },
+    },
+    {
+        "name": "edit_note",
+        "description": (
+            "Ändert einen bestehenden Abschnitt einer Notiz gezielt (str_replace "
+            "-Pattern, wie beim text_editor-Tool): `old_text` muss GENAU EINMAL "
+            "in der Datei vorkommen. Bevorzugt gegenüber create_note für Updates "
+            "an bestehenden Notizen — überschreibt nicht die ganze Datei. Auch "
+            "geeignet, um veraltete Infos zu entfernen/korrigieren (z.B. "
+            "old_text='- Alte Info\\n', new_text='')."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file": {
+                    "type": "string",
+                    "description": "Relativer Pfad innerhalb des Vaults.",
+                },
+                "old_text": {
+                    "type": "string",
+                    "description": "Exakt zu ersetzender Text (muss eindeutig vorkommen).",
+                },
+                "new_text": {
+                    "type": "string",
+                    "description": "Ersatztext (leer, um old_text zu entfernen).",
+                },
+            },
+            "required": ["file", "old_text", "new_text"],
+        },
+    },
+    {
+        "name": "delete_note",
+        "description": (
+            "Löscht eine Notiz endgültig aus dem Vault. Nur für eindeutig "
+            "veraltete/überholte Notizen — im Zweifel lieber edit_note nutzen "
+            "oder Manuel fragen, statt zu löschen."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file": {
+                    "type": "string",
+                    "description": "Relativer Pfad innerhalb des Vaults.",
                 }
             },
             "required": ["file"],
@@ -1656,6 +1891,10 @@ TOOL_FUNCTIONS: dict[str, Callable[..., dict[str, Any]]] = {
     "get_calendar": get_calendar,
     "search_notes": search_notes,
     "read_note": read_note,
+    "create_note": create_note,
+    "append_note": append_note,
+    "edit_note": edit_note,
+    "delete_note": delete_note,
     "merge_exercises": merge_exercises,
     "sync_hevy_now": sync_hevy_now,
     "search_hevy_exercises": search_hevy_exercises,
