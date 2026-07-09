@@ -75,16 +75,8 @@ kannst Gym-Slots passend um Arbeit/Termine herum vorschlagen. Mit search_notes
 und read_note kannst du in Manuels persönlichen Notizen (Obsidian) suchen,
 wenn es hilft, ihn zu verstehen oder Fragen zu beantworten.
 
-Heutiges Datum: {today}
-
 DB-Schema (SQLite):
 {schema}
-
-Nutzerprofil (aktueller Stand):
-{profile}
-
-Was du bereits über Manuel weißt (Langzeit-Gedächtnis):
-{memories}
 """
 
 ASSISTANT_SYSTEM_PROMPT_TEMPLATE = """Du bist Manuels persönlicher Assistent – sein Chief of Staff.
@@ -122,17 +114,20 @@ wenn es fertig ist (Status jederzeit mit check_dev_task). (5) Gemergt wird
 mit merge_dev_branch NUR, wenn Manuel es explizit sagt – danach erinnerst du
 ihn an den Bot-Neustart.
 
-Heutiges Datum: {today}
-
 DB-Schema (SQLite):
 {schema}
+"""
+
+# Dynamischer Kontext (Datum, Profil, Memories) wird als EIGENER System-Block
+# NACH dem Cache-Breakpoint gesendet (siehe trainer.agent.core), damit der
+# stabile Prompt-Teil oben byte-identisch bleibt und der Prompt-Cache greift.
+DYNAMIC_CONTEXT_TEMPLATE = """Heutiges Datum: {today}
 
 Nutzerprofil (aktueller Stand):
 {profile}
 
-Was du bereits über Manuel weißt (Langzeit-Gedächtnis, geteilt mit Isa):
-{memories}
-"""
+Was du bereits über Manuel weißt (Langzeit-Gedächtnis, geteilt zwischen den Agenten):
+{memories}"""
 
 ISA_TOOL_NAMES: list[str] = [
     "get_health_summary",
@@ -152,6 +147,10 @@ ISA_TOOL_NAMES: list[str] = [
     "sync_hevy_now",
     "search_hevy_exercises",
     "create_hevy_routine",
+    "update_hevy_routine",
+    "update_hevy_workout",
+    "log_body_measurement",
+    "update_body_measurement",
 ]
 
 # Bewusst KEIN log_workout/log_meal — das ist Isas Job, siehe System-Prompt.

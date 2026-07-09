@@ -11,7 +11,14 @@ import sqlite3
 import pytest
 
 import trainer.agent.tools as tools_module
-from trainer.agent.tools import _build_hevy_routine_payload, create_hevy_routine
+from trainer.agent.tools import (
+    _build_hevy_routine_payload,
+    create_hevy_routine,
+    log_body_measurement,
+    update_body_measurement,
+    update_hevy_routine,
+    update_hevy_workout,
+)
 
 
 def _conn_with_templates() -> sqlite3.Connection:
@@ -95,6 +102,12 @@ class _FakeResponse:
         return self._payload
 
 
+class _FakeResponseWithStatus(_FakeResponse):
+    def __init__(self, status_code: int, payload: dict) -> None:
+        super().__init__(payload)
+        self.status_code = status_code
+
+
 def test_create_hevy_routine_parses_real_response_shape(monkeypatch):
     """Live gegen die echte Hevy-API beobachtete 201-Response:
     {"routine": [{"id": "...", ...}]} — `routine` als Liste, nicht als Objekt.
@@ -125,3 +138,110 @@ def test_create_hevy_routine_parses_real_response_shape(monkeypatch):
     )
 
     assert result["routine_id"] == "970690f1-575b-4f2f-8b56-fcec73c11658"
+
+
+def _require_hevy_key():
+    if not tools_module.config.hevy_api_key:
+        pytest.skip("HEVY_API_KEY nicht gesetzt — Config ist frozen, kann in Tests nicht gepatcht werden")
+
+
+def test_update_hevy_routine_preserves_unspecified_fields(monkeypatch):
+    """Nur title angegeben -> notes/exercises müssen aus dem GET übernommen
+    werden, sonst würde Hevys PUT (Full-Replace) sie auf null/leer setzen."""
+    _require_hevy_key()
+
+    get_response = _FakeResponse(
+        {
+            "routine": {
+                "id": "r1",
+                "title": "Old Title",
+                "notes": "Old notes",
+                "exercises": [{"exercise_template_id": "3BC06AD3", "sets": []}],
+            }
+        }
+    )
+    put_calls = []
+
+    def fake_put(url, **kwargs):
+        put_calls.append(kwargs["json"])
+        return _FakeResponse({"routine": {"id": "r1", **kwargs["json"]["routine"]}})
+
+    monkeypatch.setattr(tools_module.httpx, "get", lambda *a, **kw: get_response)
+    monkeypatch.setattr(tools_module.httpx, "put", fake_put)
+
+    result = update_hevy_routine("r1", title="New Title")
+
+    assert result["routine_id"] == "r1"
+    sent = put_calls[0]["routine"]
+    assert sent["title"] == "New Title"
+    assert sent["notes"] == "Old notes"
+    assert sent["exercises"] == [{"exercise_template_id": "3BC06AD3", "sets": []}]
+
+
+def test_update_hevy_workout_replaces_exercises_when_given(monkeypatch):
+    _require_hevy_key()
+
+    get_response = _FakeResponse(
+        {
+            "workout": {
+                "id": "w1",
+                "title": "Old Workout",
+                "description": "Old desc",
+                "start_time": "2026-01-01T10:00:00Z",
+                "end_time": "2026-01-01T10:30:00Z",
+                "is_private": False,
+                "exercises": [],
+            }
+        }
+    )
+    monkeypatch.setattr(tools_module, "init_db", lambda: None)
+    monkeypatch.setattr(tools_module, "get_connection", lambda: _conn_with_templates())
+    monkeypatch.setattr(tools_module.httpx, "get", lambda *a, **kw: get_response)
+
+    put_calls = []
+
+    def fake_put(url, **kwargs):
+        put_calls.append(kwargs["json"])
+        return _FakeResponse({"workout": {"id": "w1", **kwargs["json"]["workout"]}})
+
+    monkeypatch.setattr(tools_module.httpx, "put", fake_put)
+
+    result = update_hevy_workout(
+        "w1", exercises=[{"name": "Bicep Curl", "sets": 2, "reps": 8}]
+    )
+
+    assert result["workout_id"] == "w1"
+    sent = put_calls[0]["workout"]
+    assert sent["title"] == "Old Workout"  # nicht angegeben -> unverändert
+    exercise = sent["exercises"][0]
+    assert exercise["exercise_template_id"] == "3BC06AD3"
+    assert "rest_seconds" not in exercise  # Workout-Exercises kennen das Feld nicht
+
+
+def test_log_body_measurement_conflict_returns_friendly_error(monkeypatch):
+    _require_hevy_key()
+    monkeypatch.setattr(
+        tools_module.httpx,
+        "post",
+        lambda *a, **kw: _FakeResponseWithStatus(409, {}),
+    )
+
+    result = log_body_measurement("2026-07-09", weight_kg=80.5)
+
+    assert "error" in result
+    assert "2026-07-09" in result["error"]
+
+
+def test_update_body_measurement_sends_only_provided_fields(monkeypatch):
+    _require_hevy_key()
+    put_calls = []
+
+    def fake_put(url, **kwargs):
+        put_calls.append(kwargs["json"])
+        return _FakeResponse({"date": "2026-07-09"})
+
+    monkeypatch.setattr(tools_module.httpx, "put", fake_put)
+
+    update_body_measurement("2026-07-09", weight_kg=79.0)
+
+    assert put_calls[0] == {"weight_kg": 79.0}

@@ -129,7 +129,11 @@ def get_health_summary(days: int = 7) -> dict[str, Any]:
 
 
 def get_workouts(days: int = 14) -> dict[str, Any]:
-    """Workouts inkl. Sätze der letzten `days` Tage (alle Quellen)."""
+    """Workouts inkl. Sätze der letzten `days` Tage (alle Quellen).
+
+    `hevy_workout_id` (nur gesetzt bei source='hevy') ist die native Hevy-ID —
+    wird von `update_hevy_workout` benötigt, um das Workout live zu bearbeiten.
+    """
     init_db()
     conn = get_connection()
     try:
@@ -137,7 +141,7 @@ def get_workouts(days: int = 14) -> dict[str, Any]:
 
         workout_rows = conn.execute(
             """
-            SELECT id, date, type, source, notes
+            SELECT id, date, type, source, notes, ext_id AS hevy_workout_id
             FROM workouts
             WHERE date >= ?
             ORDER BY date DESC, id DESC
@@ -752,13 +756,35 @@ def _best_hevy_template_match(
     return None
 
 
-def _build_hevy_routine_payload(
-    conn: sqlite3.Connection, title: str, exercises: list[dict[str, Any]]
-) -> tuple[dict[str, Any], list[dict[str, Any]], list[str]]:
-    """Baut den POST-Payload für /v1/routines + Match-/Unmatch-Listen.
+def _hevy_headers() -> dict[str, str]:
+    return {"api-key": config.hevy_api_key, "Content-Type": "application/json"}
 
-    Reine Funktion ohne Netzwerk-Aufruf — separat testbar (Dry-Run) und von
-    `create_hevy_routine` genutzt.
+
+def _hevy_unwrap(data: dict[str, Any], key: str) -> dict[str, Any]:
+    """Extrahiert ein verschachteltes Objekt aus einer Hevy-Response.
+
+    Hevys eigene OpenAPI-Doku dokumentiert `{key: {...}}` (einzelnes Objekt),
+    live beobachtet liefert die API aber teils `{key: [{...}]}` (Array mit
+    einem Element) — z.B. bei POST /v1/routines. Beide Formen abfangen, statt
+    der Doku blind zu vertrauen.
+    """
+    obj = data.get(key) or {}
+    if isinstance(obj, list):
+        obj = obj[0] if obj else {}
+    return obj
+
+
+def _match_hevy_exercises(
+    conn: sqlite3.Connection,
+    exercises: list[dict[str, Any]],
+    *,
+    include_rest_seconds: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    """Matched rohe {name, sets, reps, rest_seconds?}-Einträge gegen den Hevy-
+    Übungskatalog und baut die Exercise-Payload (exercise_template_id + sets).
+
+    `rest_seconds` nur anhängen, wenn `include_rest_seconds` — Routinen kennen
+    das Feld, Workout-Exercises (PostWorkoutsRequestExercise) nicht.
     """
     templates = [
         dict(r)
@@ -791,11 +817,26 @@ def _build_hevy_routine_payload(
                 for _ in range(max(sets, 1))
             ],
         }
-        rest_seconds = ex.get("rest_seconds")
-        if rest_seconds is not None:
-            exercise_payload["rest_seconds"] = rest_seconds
+        if include_rest_seconds:
+            rest_seconds = ex.get("rest_seconds")
+            if rest_seconds is not None:
+                exercise_payload["rest_seconds"] = rest_seconds
         payload_exercises.append(exercise_payload)
 
+    return payload_exercises, matched, unmatched
+
+
+def _build_hevy_routine_payload(
+    conn: sqlite3.Connection, title: str, exercises: list[dict[str, Any]]
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[str]]:
+    """Baut den POST-Payload für /v1/routines + Match-/Unmatch-Listen.
+
+    Reine Funktion ohne Netzwerk-Aufruf — separat testbar (Dry-Run) und von
+    `create_hevy_routine` genutzt.
+    """
+    payload_exercises, matched, unmatched = _match_hevy_exercises(
+        conn, exercises, include_rest_seconds=True
+    )
     # folder_id MUSS explizit gesendet werden — Hevy lehnt POST /v1/routines
     # sonst mit 400 "Invalid routine folder id: undefined" ab. `null` legt die
     # Routine im Standard-Ordner "My Routines" an (siehe Hevy-OpenAPI-Doku).
@@ -845,7 +886,7 @@ def create_hevy_routine(title: str, exercises: list[dict[str, Any]]) -> dict[str
     try:
         resp = httpx.post(
             f"{hevy_ingest.API_BASE}/v1/routines",
-            headers={"api-key": config.hevy_api_key, "Content-Type": "application/json"},
+            headers=_hevy_headers(),
             json=payload,
             timeout=30,
         )
@@ -854,12 +895,7 @@ def create_hevy_routine(title: str, exercises: list[dict[str, Any]]) -> dict[str
         return {"error": f"Hevy-API-Fehler beim Erstellen der Routine: {exc}"}
 
     data = resp.json()
-    # Live beobachtet: Hevy liefert "routine" als Array mit einem Element
-    # zurück, nicht als einzelnes Objekt (weicht von der eigenen OpenAPI-Doku
-    # ab, die ein plain object dokumentiert) — beide Formen abfangen.
-    routine_obj: dict[str, Any] = data.get("routine") or {}
-    if isinstance(routine_obj, list):
-        routine_obj = routine_obj[0] if routine_obj else {}
+    routine_obj = _hevy_unwrap(data, "routine")
     routine_id = data.get("id") or routine_obj.get("id")
 
     return {
@@ -867,6 +903,239 @@ def create_hevy_routine(title: str, exercises: list[dict[str, Any]]) -> dict[str
         "matched": matched,
         "unmatched": unmatched,
     }
+
+
+def update_hevy_routine(
+    routine_id: str,
+    title: str | None = None,
+    notes: str | None = None,
+    exercises: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Bearbeitet eine bestehende Hevy-Routine (PUT /v1/routines/{routineId}).
+
+    Holt zuerst den aktuellen Stand per GET, damit nicht angegebene Felder
+    unverändert bleiben — Hevys PUT ersetzt das komplette Routine-Objekt.
+    `exercises`, falls angegeben, ERSETZT alle Übungen komplett (gleiche
+    Fuzzy-Match-Logik wie bei `create_hevy_routine`; nicht gematchte Namen
+    werden nicht geraten, sondern als "unmatched" zurückgegeben).
+    """
+    if not config.hevy_api_key:
+        return {"error": "Hevy ist nicht konfiguriert (HEVY_API_KEY fehlt)."}
+
+    try:
+        get_resp = httpx.get(
+            f"{hevy_ingest.API_BASE}/v1/routines/{routine_id}",
+            headers=_hevy_headers(),
+            timeout=30,
+        )
+        get_resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        return {"error": f"Hevy-Routine {routine_id} nicht gefunden: {exc}"}
+
+    current = _hevy_unwrap(get_resp.json(), "routine")
+
+    matched: list[dict[str, Any]] = []
+    unmatched: list[str] = []
+    if exercises is not None:
+        init_db()
+        conn = get_connection()
+        try:
+            payload_exercises, matched, unmatched = _match_hevy_exercises(
+                conn, exercises, include_rest_seconds=True
+            )
+        finally:
+            conn.close()
+        if not matched:
+            return {
+                "error": "Keine der angegebenen Übungen konnte gematcht werden.",
+                "unmatched": unmatched,
+            }
+    else:
+        payload_exercises = current.get("exercises", [])
+
+    routine_body = {
+        "title": title if title is not None else current.get("title"),
+        "notes": notes if notes is not None else current.get("notes"),
+        "exercises": payload_exercises,
+    }
+
+    try:
+        resp = httpx.put(
+            f"{hevy_ingest.API_BASE}/v1/routines/{routine_id}",
+            headers=_hevy_headers(),
+            json={"routine": routine_body},
+            timeout=30,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        return {"error": f"Hevy-API-Fehler beim Bearbeiten der Routine: {exc}"}
+
+    updated = _hevy_unwrap(resp.json(), "routine")
+    return {
+        "routine_id": updated.get("id", routine_id),
+        "matched": matched,
+        "unmatched": unmatched,
+    }
+
+
+def update_hevy_workout(
+    workout_id: str,
+    title: str | None = None,
+    description: str | None = None,
+    exercises: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Bearbeitet ein bestehendes Hevy-Workout (PUT /v1/workouts/{workoutId}).
+
+    `workout_id` ist die native Hevy-Workout-ID (`ext_id` in `get_workouts`,
+    nur für source='hevy' gesetzt — bei Chat-geloggten Workouts existiert kein
+    Hevy-Pendant). Holt zuerst den aktuellen Stand per GET, damit nicht
+    angegebene Felder unverändert bleiben. `exercises`, falls angegeben,
+    ERSETZT alle Übungen komplett.
+    """
+    if not config.hevy_api_key:
+        return {"error": "Hevy ist nicht konfiguriert (HEVY_API_KEY fehlt)."}
+
+    try:
+        get_resp = httpx.get(
+            f"{hevy_ingest.API_BASE}/v1/workouts/{workout_id}",
+            headers=_hevy_headers(),
+            timeout=30,
+        )
+        get_resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        return {"error": f"Hevy-Workout {workout_id} nicht gefunden: {exc}"}
+
+    current = _hevy_unwrap(get_resp.json(), "workout")
+
+    matched: list[dict[str, Any]] = []
+    unmatched: list[str] = []
+    if exercises is not None:
+        init_db()
+        conn = get_connection()
+        try:
+            payload_exercises, matched, unmatched = _match_hevy_exercises(
+                conn, exercises, include_rest_seconds=False
+            )
+        finally:
+            conn.close()
+        if not matched:
+            return {
+                "error": "Keine der angegebenen Übungen konnte gematcht werden.",
+                "unmatched": unmatched,
+            }
+    else:
+        payload_exercises = current.get("exercises", [])
+
+    workout_body = {
+        "title": title if title is not None else current.get("title"),
+        "description": description if description is not None else current.get("description"),
+        "start_time": current.get("start_time"),
+        "end_time": current.get("end_time"),
+        "is_private": current.get("is_private", False),
+        "exercises": payload_exercises,
+    }
+
+    try:
+        resp = httpx.put(
+            f"{hevy_ingest.API_BASE}/v1/workouts/{workout_id}",
+            headers=_hevy_headers(),
+            json={"workout": workout_body},
+            timeout=30,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        return {"error": f"Hevy-API-Fehler beim Bearbeiten des Workouts: {exc}"}
+
+    updated = _hevy_unwrap(resp.json(), "workout")
+    return {
+        "workout_id": updated.get("id", workout_id),
+        "matched": matched,
+        "unmatched": unmatched,
+    }
+
+
+_BODY_MEASUREMENT_FIELDS = (
+    "weight_kg",
+    "lean_mass_kg",
+    "fat_percent",
+    "neck_cm",
+    "shoulder_cm",
+    "chest_cm",
+    "left_bicep_cm",
+    "right_bicep_cm",
+    "left_forearm_cm",
+    "right_forearm_cm",
+    "abdomen",
+    "waist",
+    "hips",
+    "left_thigh",
+    "right_thigh",
+    "left_calf",
+    "right_calf",
+)
+
+
+def log_body_measurement(date: str, **fields: Any) -> dict[str, Any]:
+    """Legt einen Körpermaß-Eintrag für ein Datum an (POST /v1/body_measurements).
+
+    `date`: YYYY-MM-DD. Restliche Felder optional, siehe `_BODY_MEASUREMENT_FIELDS`
+    (Gewicht, Körperfett%, Umfänge in cm). Hevy liefert 409, wenn für das Datum
+    bereits ein Eintrag existiert — dann `update_body_measurement` nutzen.
+    """
+    if not config.hevy_api_key:
+        return {"error": "Hevy ist nicht konfiguriert (HEVY_API_KEY fehlt)."}
+
+    body = {"date": date}
+    for key in _BODY_MEASUREMENT_FIELDS:
+        if fields.get(key) is not None:
+            body[key] = fields[key]
+
+    try:
+        resp = httpx.post(
+            f"{hevy_ingest.API_BASE}/v1/body_measurements",
+            headers=_hevy_headers(),
+            json=body,
+            timeout=30,
+        )
+        if resp.status_code == 409:
+            return {
+                "error": (
+                    f"Für {date} existiert bereits ein Körpermaß-Eintrag — "
+                    "update_body_measurement nutzen, um ihn zu ändern."
+                )
+            }
+        resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        return {"error": f"Hevy-API-Fehler beim Anlegen des Körpermaß-Eintrags: {exc}"}
+
+    return {"date": date, "saved": True}
+
+
+def update_body_measurement(date: str, **fields: Any) -> dict[str, Any]:
+    """Ändert einen bestehenden Körpermaß-Eintrag (PUT /v1/body_measurements/{date}).
+
+    ACHTUNG (Hevy-API-Verhalten): PUT überschreibt ALLE Felder — nicht
+    angegebene Felder werden auf null gesetzt, es gibt kein Partial-Update.
+    Nur mit vollständigen Werten aufrufen, sonst gehen bestehende Messwerte
+    verloren.
+    """
+    if not config.hevy_api_key:
+        return {"error": "Hevy ist nicht konfiguriert (HEVY_API_KEY fehlt)."}
+
+    body = {key: fields.get(key) for key in _BODY_MEASUREMENT_FIELDS if key in fields}
+
+    try:
+        resp = httpx.put(
+            f"{hevy_ingest.API_BASE}/v1/body_measurements/{date}",
+            headers=_hevy_headers(),
+            json=body,
+            timeout=30,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        return {"error": f"Hevy-API-Fehler beim Ändern des Körpermaß-Eintrags: {exc}"}
+
+    return {"date": date, "saved": True}
 
 
 # ---------------------------------------------------------------------------
@@ -898,7 +1167,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "description": (
             "Liefert alle geloggten Workouts (inkl. Sätze: Übung, Satznummer, "
             "Wiederholungen, Gewicht) der letzten N Tage, unabhängig von der Quelle "
-            "(Strong-CSV-Import oder Chat-Logging)."
+            "(Strong-CSV-Import oder Chat-Logging). Enthält `hevy_workout_id` "
+            "(nur bei source='hevy') — die für update_hevy_workout gebraucht wird."
         ),
         "input_schema": {
             "type": "object",
@@ -1223,6 +1493,153 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "required": ["title", "exercises"],
         },
     },
+    {
+        "name": "update_hevy_routine",
+        "description": (
+            "Bearbeitet eine bestehende Hevy-Routine (Titel, Notizen, Übungen). "
+            "Nicht angegebene Felder bleiben unverändert. `exercises`, falls "
+            "angegeben, ERSETZT alle Übungen der Routine komplett (gleiches "
+            "Fuzzy-Matching wie create_hevy_routine). Schreibt live in Hevy, "
+            "also nur nach klarer Absicht/Bestätigung von Manuel aufrufen."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "routine_id": {
+                    "type": "string",
+                    "description": "Die Hevy-Routine-ID (aus create_hevy_routine oder Manuel genannt).",
+                },
+                "title": {"type": "string", "description": "Neuer Titel (optional)."},
+                "notes": {"type": "string", "description": "Neue Notizen (optional)."},
+                "exercises": {
+                    "type": "array",
+                    "description": "Neue vollständige Übungsliste (ersetzt die alte, optional).",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Übungsname (wird gegen Hevy-Katalog gematcht).",
+                            },
+                            "sets": {"type": "integer", "description": "Anzahl Sätze."},
+                            "reps": {"type": "integer", "description": "Ziel-Wiederholungen pro Satz."},
+                            "rest_seconds": {
+                                "type": "integer",
+                                "description": "Optionale Satzpause in Sekunden.",
+                            },
+                        },
+                        "required": ["name", "sets"],
+                    },
+                },
+            },
+            "required": ["routine_id"],
+        },
+    },
+    {
+        "name": "update_hevy_workout",
+        "description": (
+            "Bearbeitet ein bestehendes Hevy-Workout (Titel, Beschreibung, "
+            "Übungen). `workout_id` ist die `hevy_workout_id` aus get_workouts "
+            "(nur bei source='hevy' vorhanden — Chat-geloggte Workouts existieren "
+            "nicht in Hevy). Nicht angegebene Felder bleiben unverändert. "
+            "`exercises`, falls angegeben, ERSETZT alle Übungen komplett. "
+            "Schreibt live in Hevy, also nur nach klarer Absicht/Bestätigung "
+            "von Manuel aufrufen."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "workout_id": {
+                    "type": "string",
+                    "description": "Die native Hevy-Workout-ID (hevy_workout_id aus get_workouts).",
+                },
+                "title": {"type": "string", "description": "Neuer Titel (optional)."},
+                "description": {"type": "string", "description": "Neue Beschreibung (optional)."},
+                "exercises": {
+                    "type": "array",
+                    "description": "Neue vollständige Übungsliste (ersetzt die alte, optional).",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Übungsname (wird gegen Hevy-Katalog gematcht).",
+                            },
+                            "sets": {"type": "integer", "description": "Anzahl Sätze."},
+                            "reps": {"type": "integer", "description": "Wiederholungen pro Satz."},
+                        },
+                        "required": ["name", "sets"],
+                    },
+                },
+            },
+            "required": ["workout_id"],
+        },
+    },
+    {
+        "name": "log_body_measurement",
+        "description": (
+            "Legt einen Körpermaß-Eintrag (Gewicht, Körperfett%, Umfänge) für ein "
+            "Datum in Hevy an. Schlägt fehl, wenn für das Datum schon ein Eintrag "
+            "existiert — dann update_body_measurement nutzen."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date": {"type": "string", "description": "Datum YYYY-MM-DD."},
+                "weight_kg": {"type": "number", "description": "Gewicht in kg."},
+                "fat_percent": {"type": "number", "description": "Körperfettanteil in %."},
+                "lean_mass_kg": {"type": "number", "description": "Magermasse in kg."},
+                "neck_cm": {"type": "number", "description": "Nackenumfang in cm."},
+                "shoulder_cm": {"type": "number", "description": "Schulterumfang in cm."},
+                "chest_cm": {"type": "number", "description": "Brustumfang in cm."},
+                "left_bicep_cm": {"type": "number", "description": "Bizepsumfang links in cm."},
+                "right_bicep_cm": {"type": "number", "description": "Bizepsumfang rechts in cm."},
+                "left_forearm_cm": {"type": "number", "description": "Unterarmumfang links in cm."},
+                "right_forearm_cm": {"type": "number", "description": "Unterarmumfang rechts in cm."},
+                "abdomen": {"type": "number", "description": "Bauchumfang in cm."},
+                "waist": {"type": "number", "description": "Taillenumfang in cm."},
+                "hips": {"type": "number", "description": "Hüftumfang in cm."},
+                "left_thigh": {"type": "number", "description": "Oberschenkelumfang links in cm."},
+                "right_thigh": {"type": "number", "description": "Oberschenkelumfang rechts in cm."},
+                "left_calf": {"type": "number", "description": "Wadenumfang links in cm."},
+                "right_calf": {"type": "number", "description": "Wadenumfang rechts in cm."},
+            },
+            "required": ["date"],
+        },
+    },
+    {
+        "name": "update_body_measurement",
+        "description": (
+            "Ändert einen bestehenden Körpermaß-Eintrag für ein Datum. ACHTUNG: "
+            "Hevy überschreibt beim Update ALLE Felder — nicht angegebene Werte "
+            "werden auf null gesetzt. Nur mit vollständigen, aktuellen Werten "
+            "aufrufen (ggf. vorher get_health_summary/Vorwerte erfragen)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date": {"type": "string", "description": "Datum YYYY-MM-DD des zu ändernden Eintrags."},
+                "weight_kg": {"type": "number", "description": "Gewicht in kg."},
+                "fat_percent": {"type": "number", "description": "Körperfettanteil in %."},
+                "lean_mass_kg": {"type": "number", "description": "Magermasse in kg."},
+                "neck_cm": {"type": "number", "description": "Nackenumfang in cm."},
+                "shoulder_cm": {"type": "number", "description": "Schulterumfang in cm."},
+                "chest_cm": {"type": "number", "description": "Brustumfang in cm."},
+                "left_bicep_cm": {"type": "number", "description": "Bizepsumfang links in cm."},
+                "right_bicep_cm": {"type": "number", "description": "Bizepsumfang rechts in cm."},
+                "left_forearm_cm": {"type": "number", "description": "Unterarmumfang links in cm."},
+                "right_forearm_cm": {"type": "number", "description": "Unterarmumfang rechts in cm."},
+                "abdomen": {"type": "number", "description": "Bauchumfang in cm."},
+                "waist": {"type": "number", "description": "Taillenumfang in cm."},
+                "hips": {"type": "number", "description": "Hüftumfang in cm."},
+                "left_thigh": {"type": "number", "description": "Oberschenkelumfang links in cm."},
+                "right_thigh": {"type": "number", "description": "Oberschenkelumfang rechts in cm."},
+                "left_calf": {"type": "number", "description": "Wadenumfang links in cm."},
+                "right_calf": {"type": "number", "description": "Wadenumfang rechts in cm."},
+            },
+            "required": ["date"],
+        },
+    },
 ]
 
 TOOL_FUNCTIONS: dict[str, Callable[..., dict[str, Any]]] = {
@@ -1243,6 +1660,10 @@ TOOL_FUNCTIONS: dict[str, Callable[..., dict[str, Any]]] = {
     "sync_hevy_now": sync_hevy_now,
     "search_hevy_exercises": search_hevy_exercises,
     "create_hevy_routine": create_hevy_routine,
+    "update_hevy_routine": update_hevy_routine,
+    "update_hevy_workout": update_hevy_workout,
+    "log_body_measurement": log_body_measurement,
+    "update_body_measurement": update_body_measurement,
 }
 
 
