@@ -19,7 +19,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -149,6 +149,7 @@ def health_overview(days: int = 30) -> dict[str, Any]:
                     "date": d,
                     "sleep_score": entry.get("sleep_score"),
                     "readiness_score": entry.get("readiness_score"),
+                    "activity_score": entry.get("activity_score"),
                     "hrv_avg": _round(entry.get("hrv_avg")),
                     "resting_hr": _round(entry.get("resting_hr")),
                     "sleep_duration_min": entry.get("sleep_duration_min"),
@@ -212,20 +213,24 @@ def health_overview(days: int = 30) -> dict[str, Any]:
         today_data: dict[str, Any] = {
             "sleep_score": None,
             "readiness_score": None,
+            "activity_score": None,
             "hrv_avg": None,
             "resting_hr": None,
+            "sleep_duration_min": None,
+            "steps": None,
         }
+        today_fields = (
+            "sleep_score",
+            "readiness_score",
+            "activity_score",
+            "hrv_avg",
+            "resting_hr",
+            "sleep_duration_min",
+            "steps",
+        )
         for entry in reversed(daily):
-            if any(
-                entry[k] is not None
-                for k in ("sleep_score", "readiness_score", "hrv_avg", "resting_hr")
-            ):
-                today_data = {
-                    "sleep_score": entry["sleep_score"],
-                    "readiness_score": entry["readiness_score"],
-                    "hrv_avg": entry["hrv_avg"],
-                    "resting_hr": entry["resting_hr"],
-                }
+            if any(entry[k] is not None for k in today_fields):
+                today_data = {k: entry[k] for k in today_fields}
                 break
 
         return {
@@ -287,6 +292,36 @@ def overview() -> dict[str, Any]:
             "count": meal_row["n"] if meal_row and meal_row["n"] is not None else 0,
         }
 
+        week_cutoff = (date.today() - timedelta(days=6)).isoformat()
+        avg_row = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS days_logged,
+                AVG(calories_kcal) AS calories_kcal,
+                AVG(protein_g) AS protein_g,
+                AVG(carbs_g) AS carbs_g,
+                AVG(fat_g) AS fat_g
+            FROM (
+                SELECT substr(ts, 1, 10) AS d,
+                       SUM(calories_kcal) AS calories_kcal,
+                       SUM(protein_g) AS protein_g,
+                       SUM(carbs_g) AS carbs_g,
+                       SUM(fat_g) AS fat_g
+                FROM meals
+                WHERE ts IS NOT NULL AND substr(ts, 1, 10) >= ?
+                GROUP BY d
+            )
+            """,
+            (week_cutoff,),
+        ).fetchone()
+        meals_7d_avg = {
+            "calories_kcal": _round(avg_row["calories_kcal"], 0) if avg_row else None,
+            "protein_g": _round(avg_row["protein_g"]) if avg_row else None,
+            "carbs_g": _round(avg_row["carbs_g"]) if avg_row else None,
+            "fat_g": _round(avg_row["fat_g"]) if avg_row else None,
+            "days_logged": avg_row["days_logged"] if avg_row and avg_row["days_logged"] else 0,
+        }
+
         sync_row = conn.execute(
             "SELECT value FROM sync_state WHERE key = 'oura_last_sync'"
         ).fetchone()
@@ -312,6 +347,7 @@ def overview() -> dict[str, Any]:
         "next_events": next_events,
         "last_workouts": last_workouts,
         "meals_today": meals_today,
+        "meals_7d_avg": meals_7d_avg,
         "system": {
             "oura_last_sync": oura_last_sync,
             "db_size_mb": db_size_mb,
@@ -321,9 +357,74 @@ def overview() -> dict[str, Any]:
 
 
 @app.get("/api/workouts")
-def workouts(days: int = 60) -> dict[str, Any]:
-    """Workouts der letzten `days` Tage (Durchreiche von get_workouts)."""
-    return get_workouts(days)
+def workouts(
+    days: int = 60,
+    types: list[str] | None = Query(None, alias="type"),
+    exercise: str | None = None,
+    q: str | None = None,
+) -> dict[str, Any]:
+    """Workouts der letzten `days` Tage, optional gefiltert.
+
+    `type` (mehrfach angebbar, exakter Match gegen `workouts.type`),
+    `exercise` (kanonischer Name, wie von `/api/exercises` geliefert — matcht,
+    wenn irgendein Satz des Workouts auf diesen Namen canonicalized),
+    `q` (Freitext, case-insensitive Substring gegen type/notes/Übungsnamen).
+    Filter laufen als Python-Post-Filter über `get_workouts(days)`, das
+    Frontend holt bewusst einmal ein großes Zeitfenster und filtert danach
+    clientseitig weiter — die Backend-Filter existieren trotzdem eigenständig
+    nutzbar (z.B. für curl-Tests).
+
+    `facets.types` listet alle im `days`-Fenster vorkommenden `workouts.type`-
+    Werte, UNGEFILTERT, damit das Frontend Filter-Chips bauen kann, ohne dass
+    ein aktiver Filter die restlichen Optionen verschwinden lässt.
+    """
+    result = get_workouts(days)
+    all_workouts = result.get("workouts") or []
+
+    facet_types = sorted({w["type"] for w in all_workouts if w.get("type")})
+
+    filtered = all_workouts
+    if types:
+        wanted = {t.strip() for t in types if t.strip()}
+        filtered = [w for w in filtered if (w.get("type") or "").strip() in wanted]
+
+    if exercise:
+        init_db()
+        conn = get_connection()
+        try:
+            name_rows = conn.execute(
+                "SELECT DISTINCT exercise FROM workout_sets WHERE exercise IS NOT NULL"
+            ).fetchall()
+            alias_rows = conn.execute("SELECT alias, canonical FROM exercise_aliases").fetchall()
+        finally:
+            conn.close()
+        all_names = [r["exercise"] for r in name_rows]
+        alias_map = {r["alias"]: r["canonical"] for r in alias_rows}
+        filtered = [
+            w
+            for w in filtered
+            if any(
+                canonicalize(s.get("exercise") or "", all_names, alias_map) == exercise
+                for s in (w.get("sets") or [])
+            )
+        ]
+
+    if q and q.strip():
+        needle = q.strip().lower()
+        filtered = [
+            w
+            for w in filtered
+            if needle in (w.get("type") or "").lower()
+            or needle in (w.get("notes") or "").lower()
+            or any(needle in (s.get("exercise") or "").lower() for s in (w.get("sets") or []))
+        ]
+
+    return {
+        **result,
+        "workouts": filtered,
+        "workout_count": len(filtered),
+        "facets": {"types": facet_types},
+    }
 
 
 @app.get("/api/meals")
@@ -432,15 +533,33 @@ def list_exercises() -> list[dict[str, Any]]:
     finally:
         conn.close()
 
-    items = [
-        {
-            "name": name,
-            "sessions": len(points),
-            "last_weight_kg": points[-1]["top_weight_kg"] if points else None,
-            "category": categories.get(name, "Sonstige"),
-        }
-        for name, points in grouped.items()
-    ]
+    items = []
+    for name, points in grouped.items():
+        # PR = Datum des ERSTEN Erreichens des Maximalgewichts (nicht der
+        # letzten Wiederholung), damit ein "Neuer PR"-Badge den echten
+        # Fortschrittsmoment zeigt statt eines zufälligen späteren Tages mit
+        # gleichem Gewicht.
+        pr_weight_kg: float | None = None
+        pr_date: str | None = None
+        pr_est_1rm: float | None = None
+        running_max = float("-inf")
+        for p in points:
+            w = p["top_weight_kg"]
+            if w is not None and w > running_max:
+                running_max = w
+                pr_weight_kg, pr_date, pr_est_1rm = w, p["date"], p["est_1rm"]
+
+        items.append(
+            {
+                "name": name,
+                "sessions": len(points),
+                "last_weight_kg": points[-1]["top_weight_kg"] if points else None,
+                "category": categories.get(name, "Sonstige"),
+                "pr_weight_kg": pr_weight_kg,
+                "pr_date": pr_date,
+                "pr_est_1rm": pr_est_1rm,
+            }
+        )
     items.sort(key=lambda x: x["sessions"], reverse=True)
     return items
 
@@ -458,6 +577,61 @@ def exercise_progress(name: str) -> dict[str, Any]:
         conn.close()
 
     return {"name": name, "points": grouped.get(name, [])}
+
+
+@app.get("/api/training/volume")
+def training_volume(weeks: int = 12) -> dict[str, Any]:
+    """Trainingsvolumen (Summe weight_kg × reps) pro Kalenderwoche (Montag-Start),
+    auch leere Wochen mit 0 — gleiches Zero-Fill-Pattern wie `workouts_per_week`
+    in `health_overview`, nur über `workout_sets` statt `workouts` aggregiert."""
+    init_db()
+    conn = get_connection()
+    try:
+        today = date.today()
+        current_monday = today - timedelta(days=today.weekday())
+        week_starts = [current_monday - timedelta(weeks=n) for n in range(weeks - 1, -1, -1)]
+        cutoff = week_starts[0].isoformat()
+
+        rows = conn.execute(
+            """
+            SELECT w.date AS date, w.id AS workout_id, s.weight_kg AS weight_kg, s.reps AS reps
+            FROM workout_sets s
+            JOIN workouts w ON s.workout_id = w.id
+            WHERE w.date IS NOT NULL AND w.date >= ?
+              AND s.weight_kg IS NOT NULL AND s.reps IS NOT NULL
+            """,
+            (cutoff,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    buckets: dict[str, dict[str, Any]] = {
+        ws.isoformat(): {"volume_kg": 0.0, "set_count": 0, "workout_ids": set()}
+        for ws in week_starts
+    }
+    for r in rows:
+        try:
+            d = date.fromisoformat(str(r["date"])[:10])
+        except ValueError:
+            continue
+        monday = (d - timedelta(days=d.weekday())).isoformat()
+        bucket = buckets.get(monday)
+        if bucket is None:
+            continue
+        bucket["volume_kg"] += float(r["weight_kg"]) * float(r["reps"])
+        bucket["set_count"] += 1
+        bucket["workout_ids"].add(r["workout_id"])
+
+    volume_per_week = [
+        {
+            "week": ws.isoformat(),
+            "volume_kg": _round(buckets[ws.isoformat()]["volume_kg"], 0),
+            "set_count": buckets[ws.isoformat()]["set_count"],
+            "workout_count": len(buckets[ws.isoformat()]["workout_ids"]),
+        }
+        for ws in week_starts
+    ]
+    return {"weeks": weeks, "volume_per_week": volume_per_week}
 
 
 # Statische Dateien (index.html, style.css, app.js) unter / — MUSS nach den

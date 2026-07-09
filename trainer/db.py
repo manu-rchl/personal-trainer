@@ -99,6 +99,15 @@ CREATE TABLE IF NOT EXISTS hevy_exercise_templates (
     primary_muscle TEXT,
     equipment TEXT
 );
+
+-- Fitness-Zentrale-Dashboard: workout_sets/workouts/meals werden jetzt
+-- deutlich häufiger und über größere Zeitfenster abgefragt (Volumen pro
+-- Woche, Session-Historie über die gesamte Laufzeit, Makro-Trends) —
+-- CREATE INDEX IF NOT EXISTS ist idempotent, daher hier statt als
+-- try/except-Migration.
+CREATE INDEX IF NOT EXISTS idx_workout_sets_workout_id ON workout_sets (workout_id);
+CREATE INDEX IF NOT EXISTS idx_workouts_date ON workouts (date);
+CREATE INDEX IF NOT EXISTS idx_meals_ts ON meals (ts);
 """
 
 

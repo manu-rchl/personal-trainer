@@ -6,7 +6,8 @@
  *   #/chat/isa       Chat mit Isa
  *   #/chat/assistant Chat mit dem Assistant
  *   #/health         Health-Karten (Sparklines, Workouts/Woche, Protein)
- *   #/training       Workout-Liste (60 Tage, aufklappbare Sätze)
+ *   #/training       Fortschritt (Gewicht/e1RM), Volumen/Woche, PR-Highlights,
+ *                    Session-Historie (gesamt, such-/filterbar)
  *   #/ernaehrung     Protein-Balken (30 Tage) + Mahlzeiten-Liste
  * Es scrollt ausschließlich der View-Container bzw. die Chat-Nachrichtenliste,
  * nie der Body. */
@@ -96,6 +97,14 @@ function relativeTime(iso) {
   if (diffH < 24) return `vor ${diffH} Std`;
   const diffD = Math.round(diffH / 24);
   return `vor ${diffD} Tag${diffD === 1 ? "" : "en"}`;
+}
+
+function fmtDuration(min) {
+  if (min === null || min === undefined || Number.isNaN(min)) return "–";
+  const total = Math.round(min);
+  const h = Math.floor(total / 60);
+  const m = total % 60;
+  return `${h}h ${String(m).padStart(2, "0")}`;
 }
 
 function average(values) {
@@ -218,7 +227,7 @@ const ROUTES = {
   "#/health": { title: "Health", subtitle: "Oura & Trends, letzte 30 Tage", render: renderHealth },
   "#/training": {
     title: "Training",
-    subtitle: "Workouts der letzten 60 Tage",
+    subtitle: "Fortschritt, Volumen & gesamte Session-Historie",
     render: renderTraining,
   },
   "#/ernaehrung": {
@@ -323,10 +332,12 @@ async function renderDashboard(panel) {
 
   let ov;
   let health;
+  let exercises;
   try {
-    [ov, health] = await Promise.all([
+    [ov, health, exercises] = await Promise.all([
       fetchJson("/api/overview"),
       fetchJson("/api/health/overview?days=30"),
+      fetchJson("/api/exercises"),
     ]);
   } catch {
     renderFooterOffline();
@@ -464,6 +475,25 @@ async function renderDashboard(panel) {
       : '<p class="empty-state">Heute noch nichts geloggt.</p>';
   mealsCard.innerHTML = `<h3 class="card-title">Heute gegessen</h3>${mealBody}`;
   grid.appendChild(mealsCard);
+
+  // --- Kommandozentrale: domänenübergreifende Zusatzkarten ---
+  grid.appendChild(workoutsPerWeekCard(health.workouts_per_week || []));
+  grid.appendChild(prHighlightsCard(exercises, 7));
+
+  const avgCard = document.createElement("section");
+  avgCard.className = "card info-card stagger";
+  const avg7 = ov.meals_7d_avg || {};
+  const avgBody =
+    (avg7.days_logged || 0) > 0
+      ? `<div class="meal-summary">
+          <div class="meal-protein">${fmtNum(avg7.protein_g, 0)}<span class="unit">g Protein</span></div>
+          <div class="meal-meta">${fmtNum(avg7.calories_kcal, 0)} kcal · Ø über ${
+          avg7.days_logged
+        } Tag${avg7.days_logged === 1 ? "" : "e"}</div>
+        </div>`
+      : '<p class="empty-state">Letzte 7 Tage noch nichts geloggt.</p>';
+  avgCard.innerHTML = `<h3 class="card-title">Ø 7-Tage-Ernährung</h3>${avgBody}`;
+  grid.appendChild(avgCard);
 }
 
 /* ---------------------------------------------------------------------
@@ -631,21 +661,45 @@ async function renderChat(panel, agent) {
  * View 4 — Health
  * --------------------------------------------------------------------- */
 
-function metricCard(title, values, todayValue, unit, digits = 0) {
+/* Vergleicht Ø der letzten 7 Tage gegen die 7 Tage davor — bewusst OHNE
+   Gut/Schlecht-Farbcodierung, da "höher = besser" je nach Metrik variiert
+   (z.B. Ruhepuls runter ist gut, Schlaf-Score runter ist schlecht). Nur ein
+   neutraler Pfeil + Delta. */
+function trendBadge(values, digits = 0, unit = "", formatValue = fmtNum) {
+  const n = values.length;
+  const recent = average(values.slice(Math.max(0, n - 7)));
+  const prior = average(values.slice(Math.max(0, n - 14), Math.max(0, n - 7)));
+  if (recent === null || prior === null) return "";
+
+  const diff = recent - prior;
+  const factor = Math.pow(10, digits);
+  const rounded = Math.round(diff * factor) / factor;
+  if (rounded === 0) {
+    return '<span class="trend-badge trend-flat">→</span>';
+  }
+  const arrow = rounded > 0 ? "↑" : "↓";
+  const cls = rounded > 0 ? "trend-up" : "trend-down";
+  return `<span class="trend-badge ${cls}">${arrow} ${formatValue(Math.abs(rounded), digits)}${
+    unit ? " " + unit : ""
+  }</span>`;
+}
+
+function metricCard(title, values, todayValue, unit, digits = 0, formatValue = fmtNum) {
   const avg = average(values);
   const compare =
     avg === null
       ? "Ø 30 Tage: keine Daten"
-      : `Ø 30 Tage: ${fmtNum(avg, digits)}${unit ? " " + unit : ""}`;
+      : `Ø 30 Tage: ${formatValue(avg, digits)}${unit ? " " + unit : ""}`;
+  const trend = trendBadge(values, digits, unit, formatValue);
 
   const wrap = document.createElement("section");
   wrap.className = "card";
   wrap.innerHTML = `
     <h3 class="card-title">${esc(title)}</h3>
-    <div class="card-value">${todayValue != null ? fmtNum(todayValue, digits) : "–"}${
+    <div class="card-value">${todayValue != null ? formatValue(todayValue, digits) : "–"}${
     todayValue != null && unit ? `<span class="unit">${esc(unit)}</span>` : ""
   }</div>
-    <div class="card-compare">${compare}</div>
+    <div class="card-compare">${compare} ${trend}</div>
     <svg class="card-sparkline" aria-hidden="true"></svg>
   `;
   const svgEl = wrap.querySelector(".card-sparkline");
@@ -654,8 +708,8 @@ function metricCard(title, values, todayValue, unit, digits = 0) {
   const present = values.filter((v) => v != null);
   const svgTitle = document.createElementNS("http://www.w3.org/2000/svg", "title");
   svgTitle.textContent = `${title}, letzte 30 Tage: Min ${
-    present.length ? fmtNum(Math.min(...present), digits) : "–"
-  }, Max ${present.length ? fmtNum(Math.max(...present), digits) : "–"}`;
+    present.length ? formatValue(Math.min(...present), digits) : "–"
+  }, Max ${present.length ? formatValue(Math.max(...present), digits) : "–"}`;
   svgEl.prepend(svgTitle);
 
   return wrap;
@@ -759,6 +813,125 @@ function proteinBarsCard(days, title) {
   return wrap;
 }
 
+function macroBarsCard(days, title) {
+  const wrap = document.createElement("section");
+  wrap.className = "card card-wide stagger";
+  const width = 640;
+  const height = 120;
+  const padding = 24;
+  const barAreaH = height - padding * 2 - 10;
+
+  const totals = days.map((d) => (d.protein_g || 0) + (d.carbs_g || 0) + (d.fat_g || 0));
+  const maxTotal = Math.max(...totals, 1);
+  const gap = (width - padding * 2) / Math.max(days.length, 1);
+  const barWidth = gap / 1.8;
+  const scale = barAreaH / maxTotal;
+
+  let bars = "";
+  days.forEach((d, i) => {
+    const x = padding + i * gap + (gap - barWidth) / 2;
+    const dateLabel = new Date(d.date + "T00:00:00").toLocaleDateString("de-DE", {
+      day: "2-digit",
+      month: "2-digit",
+    });
+    const titleTxt = `${dateLabel}: P ${fmtNum(d.protein_g)} · C ${fmtNum(d.carbs_g)} · F ${fmtNum(
+      d.fat_g
+    )} g · ${fmtNum(d.calories_kcal, 0)} kcal`;
+    let y = height - padding;
+    [
+      ["bar-protein", d.protein_g || 0],
+      ["bar-carb", d.carbs_g || 0],
+      ["bar-fat", d.fat_g || 0],
+    ].forEach(([cls, grams]) => {
+      const h = grams * scale;
+      if (h <= 0) return;
+      y -= h;
+      bars += `<rect class="bar ${cls}" x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barWidth.toFixed(
+        1
+      )}" height="${h.toFixed(1)}"><title>${esc(titleTxt)}</title></rect>`;
+    });
+  });
+
+  const { paths: kcalPaths } = buildPathSegments(
+    days.map((d) => (d.calories_kcal != null ? d.calories_kcal : null)),
+    width,
+    height,
+    padding
+  );
+  const kcalPathsHtml = kcalPaths
+    .map((d) => `<path class="calories-line" d="${d}"></path>`)
+    .join("");
+
+  const avgKcal = average(days.map((d) => d.calories_kcal));
+  const avgProtein = average(days.map((d) => d.protein_g));
+
+  wrap.innerHTML = `
+    <div class="card-title-row">
+      <h3 class="card-title">${esc(title)}</h3>
+      <div class="macro-legend">
+        <span class="macro-legend-item"><span class="macro-legend-dot bar-protein"></span>Protein</span>
+        <span class="macro-legend-item"><span class="macro-legend-dot bar-carb"></span>Carbs</span>
+        <span class="macro-legend-item"><span class="macro-legend-dot bar-fat"></span>Fett</span>
+        <span class="macro-legend-item"><span class="macro-legend-line"></span>kcal</span>
+      </div>
+    </div>
+    <svg class="bars-svg macro-bars-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="${esc(
+    title
+  )}, gestapelt Protein/Carbs/Fett mit Kalorien-Linie">
+      ${bars}
+      ${kcalPathsHtml}
+    </svg>
+    <div class="card-compare">Ø ${fmtNum(avgKcal, 0)} kcal · ${fmtNum(avgProtein, 0)} g Protein / Tag</div>
+  `;
+  wrap.querySelectorAll(".calories-line").forEach((p) => drawIn(p));
+  return wrap;
+}
+
+function macroSplitBar(day) {
+  const wrap = document.createElement("div");
+  wrap.className = "macro-split-bar";
+  if (!day) {
+    wrap.innerHTML = '<span class="macro-split-empty">Keine Daten</span>';
+    return wrap;
+  }
+  const pKcal = (day.protein_g || 0) * 4;
+  const cKcal = (day.carbs_g || 0) * 4;
+  const fKcal = (day.fat_g || 0) * 9;
+  const total = pKcal + cKcal + fKcal;
+  if (total <= 0) {
+    wrap.innerHTML = '<span class="macro-split-empty">Keine Daten</span>';
+    return wrap;
+  }
+  wrap.innerHTML = [
+    ["bar-protein", "P", pKcal],
+    ["bar-carb", "C", cKcal],
+    ["bar-fat", "F", fKcal],
+  ]
+    .map(([cls, label, kcal]) => {
+      const pct = Math.round((kcal / total) * 100);
+      if (pct <= 0) return "";
+      return `<div class="macro-split-segment ${cls}" style="flex-basis:${pct}%"><span>${esc(
+        label
+      )} ${pct}%</span></div>`;
+    })
+    .join("");
+  return wrap;
+}
+
+function groupMealsByDay(meals) {
+  const groups = [];
+  let current = null;
+  meals.forEach((m) => {
+    const day = (m.ts || "").slice(0, 10);
+    if (!current || current.day !== day) {
+      current = { day, meals: [] };
+      groups.push(current);
+    }
+    current.meals.push(m);
+  });
+  return groups;
+}
+
 async function renderHealth(panel) {
   panel.innerHTML = '<p class="empty-state">Lade Health-Daten …</p>';
   let data;
@@ -787,12 +960,25 @@ async function renderHealth(panel) {
     ["Readiness", daily.map((d) => d.readiness_score), today.readiness_score, ""],
     ["HRV", daily.map((d) => d.hrv_avg), today.hrv_avg, "ms"],
     ["Ruhepuls", daily.map((d) => d.resting_hr), today.resting_hr, "bpm"],
+    ["Aktivität", daily.map((d) => d.activity_score), today.activity_score, ""],
+    ["Schritte", daily.map((d) => d.steps), today.steps, "Schritte"],
   ];
   tiles.forEach(([title, values, todayValue, unit]) => {
     const tile = metricCard(title, values, todayValue, unit, 0);
     tile.classList.add("stat-tile", "stagger");
     grid.appendChild(tile);
   });
+
+  const sleepDurationTile = metricCard(
+    "Schlafdauer",
+    daily.map((d) => d.sleep_duration_min),
+    today.sleep_duration_min,
+    "",
+    0,
+    fmtDuration
+  );
+  sleepDurationTile.classList.add("stat-tile", "stagger");
+  grid.appendChild(sleepDurationTile);
 
   grid.appendChild(workoutsPerWeekCard(data.workouts_per_week || []));
   grid.appendChild(proteinBarsCard(data.meals_daily || [], "Protein, letzte 14 Tage"));
@@ -888,11 +1074,17 @@ function buildProgressCard(exercises) {
   card.innerHTML = `
     <div class="progress-head">
       <h3 class="card-title">Fortschritt</h3>
-      <div class="select-wrap">
-        <select class="exercise-select" aria-label="Übung wählen"></select>
-        <svg class="select-chevron" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-          <path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
-        </svg>
+      <div class="progress-head-controls">
+        <div class="metric-toggle" role="group" aria-label="Anzeige wählen">
+          <button type="button" class="metric-toggle-btn active" data-metric="weight">Gewicht</button>
+          <button type="button" class="metric-toggle-btn" data-metric="e1rm">e1RM</button>
+        </div>
+        <div class="select-wrap">
+          <select class="exercise-select" aria-label="Übung wählen"></select>
+          <svg class="select-chevron" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+        </div>
       </div>
     </div>
     <div class="progress-readouts">
@@ -920,6 +1112,16 @@ function buildProgressCard(exercises) {
   `;
 
   const selectEl = card.querySelector(".exercise-select");
+  const metricButtons = card.querySelectorAll(".metric-toggle-btn");
+  metricButtons.forEach((btn) => {
+    btn.addEventListener("click", () => {
+      if (btn.classList.contains("active")) return;
+      metricButtons.forEach((b) => b.classList.remove("active"));
+      btn.classList.add("active");
+      card.dataset.metric = btn.dataset.metric;
+      if (card._lastProgress) renderProgressGraph(card, card._lastProgress);
+    });
+  });
 
   // Nach Trainingseinheit (category) gruppieren: Gruppen mit den meisten
   // Übungen zuerst, "Sonstige" immer zuletzt. Innerhalb einer Gruppe nach
@@ -964,6 +1166,7 @@ function buildProgressCard(exercises) {
       return;
     }
     if (!document.body.contains(card)) return; // View gewechselt
+    card._lastProgress = progress;
     renderProgressGraph(card, progress);
   }
 
@@ -994,8 +1197,9 @@ function renderProgressGraph(card, progress) {
     return;
   }
 
-  const weights = points.map((p) => p.top_weight_kg);
-  const current = points[points.length - 1].top_weight_kg;
+  const metricField = card.dataset.metric === "e1rm" ? "est_1rm" : "top_weight_kg";
+  const weights = points.map((p) => p[metricField]);
+  const current = points[points.length - 1][metricField];
   const max = Math.max(...weights);
   currentEl.textContent = `${fmtNum(current, 1)} kg`;
   maxEl.textContent = `${fmtNum(max, 1)} kg`;
@@ -1015,7 +1219,7 @@ function renderProgressGraph(card, progress) {
 
   const coords = points.map((p, i) => ({
     x: padding + i * stepX,
-    y: padding + (1 - (p.top_weight_kg - lo) / range) * usableH,
+    y: padding + (1 - (p[metricField] - lo) / range) * usableH,
     p,
   }));
 
@@ -1174,14 +1378,87 @@ function highlightProgressRow(card, dateIso) {
   });
 }
 
+function volumeBarsCard(volumePerWeek) {
+  const wrap = document.createElement("section");
+  wrap.className = "card card-wide stagger";
+  const width = 640;
+  const height = 92;
+  const padding = 24;
+  const maxVolume = Math.max(...volumePerWeek.map((w) => w.volume_kg), 1);
+  const gap = (width - padding * 2) / Math.max(volumePerWeek.length, 1);
+  const barWidth = gap / 1.8;
+
+  let bars = "";
+  volumePerWeek.forEach((w, i) => {
+    const barH = (w.volume_kg / maxVolume) * (height - padding * 2 - 16);
+    const x = padding + i * gap + (gap - barWidth) / 2;
+    const y = height - padding - barH;
+    const weekLabel = `KW ${isoWeekLabel(w.week)}`;
+    const titleTxt = `${weekLabel}: ${fmtNum(w.volume_kg, 0)} kg (${w.set_count} Sätze, ${
+      w.workout_count
+    } Workout${w.workout_count === 1 ? "" : "s"})`;
+    bars += `<rect class="bar" x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barWidth.toFixed(
+      1
+    )}" height="${Math.max(barH, 1).toFixed(1)}" rx="2"><title>${esc(titleTxt)}</title></rect>`;
+  });
+
+  const avgVolume = average(volumePerWeek.map((w) => w.volume_kg));
+
+  wrap.innerHTML = `
+    <h3 class="card-title">Trainingsvolumen pro Woche</h3>
+    <svg class="bars-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="Trainingsvolumen pro Woche, letzte ${
+    volumePerWeek.length
+  } Wochen">
+      ${bars}
+    </svg>
+    <div class="card-compare">Ø ${fmtNum(avgVolume, 0)} kg / Woche</div>
+  `;
+  return wrap;
+}
+
+function prHighlightsCard(exercises, days = 30) {
+  const wrap = document.createElement("section");
+  wrap.className = "card info-card stagger";
+
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - days);
+  const cutoffIso = cutoff.toISOString().slice(0, 10);
+
+  const prs = (exercises || [])
+    .filter((ex) => ex.pr_date && ex.pr_date >= cutoffIso)
+    .sort((a, b) => (a.pr_date < b.pr_date ? 1 : -1));
+
+  const rows = prs.length
+    ? `<ul class="info-list">${prs
+        .map(
+          (ex) => `<li class="info-row">
+            <span class="info-row-time">${esc(fmtDate(ex.pr_date))}</span>
+            <span class="info-row-main">
+              <span class="info-row-title">${esc(ex.name)}</span>
+              <span class="info-row-sub">${fmtNum(ex.pr_weight_kg, 1)} kg · e1RM ${fmtNum(
+              ex.pr_est_1rm,
+              1
+            )}</span>
+            </span>
+          </li>`
+        )
+        .join("")}</ul>`
+    : `<p class="empty-state">Keine neuen PRs in den letzten ${days} Tagen.</p>`;
+
+  wrap.innerHTML = `<h3 class="card-title">PR-Highlights</h3>${rows}`;
+  return wrap;
+}
+
 async function renderTraining(panel) {
   panel.innerHTML = '<p class="empty-state">Lade Workouts …</p>';
-  let data;
+  let base;
   let exercises;
+  let volume;
   try {
-    [data, exercises] = await Promise.all([
-      fetchJson("/api/workouts?days=60"),
+    [base, exercises, volume] = await Promise.all([
+      fetchJson("/api/workouts?days=1825"),
       fetchJson("/api/exercises"),
+      fetchJson("/api/training/volume?weeks=12"),
     ]);
   } catch {
     panel.innerHTML = '<p class="empty-state">Workouts konnten nicht geladen werden.</p>';
@@ -1192,30 +1469,147 @@ async function renderTraining(panel) {
   panel.innerHTML = "";
   panel.appendChild(buildProgressCard(exercises));
 
-  const workouts = data.workouts || [];
-  if (workouts.length === 0) {
+  const allWorkouts = base.workouts || [];
+  if (allWorkouts.length === 0) {
     const empty = document.createElement("p");
     empty.className = "empty-state";
-    empty.innerHTML = `In den letzten 60 Tagen ist nichts geloggt.
+    empty.innerHTML = `Noch nichts geloggt.
       <span class="empty-state-hint">Sag Isa im Chat, was du trainiert hast — oder importiere ein Strong-CSV.</span>`;
     panel.appendChild(empty);
     return;
   }
+
+  panel.appendChild(volumeBarsCard(volume.volume_per_week || []));
+  panel.appendChild(prHighlightsCard(exercises, 30));
 
   const heading = document.createElement("h3");
   heading.className = "section-heading stagger";
   heading.textContent = "Verlauf";
   panel.appendChild(heading);
 
+  // Filterleiste: Type-Chips und Freitext filtern rein clientseitig gegen die
+  // bereits geladene Liste (raw-Feld-Matches, keine Roundtrips pro Tastendruck).
+  // Der Übungs-Filter braucht dagegen die serverseitige `canonicalize()`-
+  // Heuristik (Strong-/Hevy-Namensvarianten zusammenführen) — die wird hier
+  // NICHT dupliziert, stattdessen holt ein Select-Change gezielt
+  // `/api/workouts?exercise=...` nach (selten genug, dass ein Roundtrip okay ist).
+  const filterBar = document.createElement("div");
+  filterBar.className = "filter-bar stagger";
+  filterBar.innerHTML = `
+    <input type="search" class="filter-input" placeholder="Suche (Übung, Notiz, Typ) …" aria-label="Workouts durchsuchen" />
+    <div class="filter-chips" role="group" aria-label="Nach Trainingstyp filtern"></div>
+    <div class="select-wrap">
+      <select class="exercise-select filter-exercise-select" aria-label="Nach Übung filtern">
+        <option value="">Alle Übungen</option>
+      </select>
+      <svg class="select-chevron" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+      </svg>
+    </div>
+    <button type="button" class="filter-reset">Filter zurücksetzen</button>
+    <span class="filter-count"></span>
+  `;
+  panel.appendChild(filterBar);
+
+  const chipsEl = filterBar.querySelector(".filter-chips");
+  (base.facets?.types || []).forEach((t) => {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "filter-chip";
+    chip.textContent = t;
+    chip.dataset.type = t;
+    chipsEl.appendChild(chip);
+  });
+
+  const exerciseSelectEl = filterBar.querySelector(".filter-exercise-select");
+  exercises.forEach((ex) => {
+    const opt = document.createElement("option");
+    opt.value = ex.name;
+    opt.textContent = ex.name;
+    exerciseSelectEl.appendChild(opt);
+  });
+
+  const searchEl = filterBar.querySelector(".filter-input");
+  const countEl = filterBar.querySelector(".filter-count");
+  const resetBtn = filterBar.querySelector(".filter-reset");
+
   const list = document.createElement("div");
   list.className = "workout-list";
   panel.appendChild(list);
 
-  workouts.forEach((w) => {
-    const row = workoutRow(w);
-    row.classList.add("stagger");
-    list.appendChild(row);
+  const filterState = { types: new Set(), q: "", workouts: allWorkouts };
+
+  function applyFilters() {
+    const q = filterState.q.trim().toLowerCase();
+    const filtered = filterState.workouts.filter((w) => {
+      if (filterState.types.size && !filterState.types.has(w.type)) return false;
+      if (!q) return true;
+      const inType = (w.type || "").toLowerCase().includes(q);
+      const inNotes = (w.notes || "").toLowerCase().includes(q);
+      const inSets = (w.sets || []).some((s) => (s.exercise || "").toLowerCase().includes(q));
+      return inType || inNotes || inSets;
+    });
+
+    list.innerHTML = "";
+    if (filtered.length === 0) {
+      const empty = document.createElement("p");
+      empty.className = "empty-state";
+      empty.textContent = "Keine Workouts passen zu diesem Filter.";
+      list.appendChild(empty);
+    } else {
+      filtered.forEach((w) => list.appendChild(workoutRow(w)));
+    }
+    countEl.textContent = `${filtered.length} von ${filterState.workouts.length} Sessions`;
+  }
+
+  async function setExerciseFilter(name) {
+    if (!name) {
+      filterState.workouts = allWorkouts;
+      applyFilters();
+      return;
+    }
+    countEl.textContent = "Lade …";
+    try {
+      const res = await fetchJson(`/api/workouts?days=1825&exercise=${encodeURIComponent(name)}`);
+      filterState.workouts = res.workouts || [];
+    } catch {
+      filterState.workouts = [];
+    }
+    applyFilters();
+  }
+
+  chipsEl.addEventListener("click", (ev) => {
+    const chip = ev.target.closest(".filter-chip");
+    if (!chip) return;
+    const t = chip.dataset.type;
+    if (filterState.types.has(t)) {
+      filterState.types.delete(t);
+      chip.classList.remove("active");
+    } else {
+      filterState.types.add(t);
+      chip.classList.add("active");
+    }
+    applyFilters();
   });
+
+  searchEl.addEventListener("input", () => {
+    filterState.q = searchEl.value;
+    applyFilters();
+  });
+
+  exerciseSelectEl.addEventListener("change", () => setExerciseFilter(exerciseSelectEl.value));
+
+  resetBtn.addEventListener("click", () => {
+    filterState.types.clear();
+    filterState.q = "";
+    searchEl.value = "";
+    exerciseSelectEl.value = "";
+    chipsEl.querySelectorAll(".filter-chip.active").forEach((c) => c.classList.remove("active"));
+    filterState.workouts = allWorkouts;
+    applyFilters();
+  });
+
+  applyFilters();
 }
 
 /* ---------------------------------------------------------------------
@@ -1235,7 +1629,7 @@ async function renderErnaehrung(panel) {
 
   panel.innerHTML = "";
 
-  // Tages-Summen zu 30 durchgehenden Tagen auffüllen (fehlender Tag = 0 g)
+  // Tages-Summen zu 30 durchgehenden Tagen auffüllen (fehlender Tag = 0)
   const totalsByDay = {};
   (data.daily_totals || []).forEach((t) => {
     totalsByDay[t.day] = t;
@@ -1248,9 +1642,38 @@ async function renderErnaehrung(panel) {
       d.getDate()
     ).padStart(2, "0")}`;
     const t = totalsByDay[iso];
-    days.push({ date: iso, protein_g: t ? t.protein_g_sum || 0 : 0 });
+    days.push({
+      date: iso,
+      protein_g: t ? t.protein_g_sum || 0 : 0,
+      carbs_g: t ? t.carbs_g_sum || 0 : 0,
+      fat_g: t ? t.fat_g_sum || 0 : 0,
+      calories_kcal: t ? t.calories_kcal_sum || 0 : 0,
+    });
   }
-  panel.appendChild(proteinBarsCard(days, "Protein, letzte 30 Tage"));
+  panel.appendChild(macroBarsCard(days, "Makros, letzte 30 Tage"));
+
+  const latestTotal = (data.daily_totals || [])[0];
+  const splitCard = document.createElement("section");
+  splitCard.className = "card stagger";
+  splitCard.innerHTML = `
+    <h3 class="card-title">Makro-Verteilung</h3>
+    <div class="card-compare">${
+      latestTotal ? esc(fmtDate(latestTotal.day)) + " — letzter geloggter Tag" : "Noch keine Daten"
+    }</div>
+    <div class="macro-split-wrap"></div>
+  `;
+  splitCard.querySelector(".macro-split-wrap").appendChild(
+    macroSplitBar(
+      latestTotal
+        ? {
+            protein_g: latestTotal.protein_g_sum,
+            carbs_g: latestTotal.carbs_g_sum,
+            fat_g: latestTotal.fat_g_sum,
+          }
+        : null
+    )
+  );
+  panel.appendChild(splitCard);
 
   const meals = data.meals || [];
   if (meals.length === 0) {
@@ -1266,19 +1689,29 @@ async function renderErnaehrung(panel) {
   list.className = "meal-list";
   panel.appendChild(list);
 
-  meals.forEach((meal) => {
-    const row = document.createElement("article");
-    row.className = "meal-row stagger";
-    const macros = `P ${fmtNum(meal.protein_g, 0)} · C ${fmtNum(meal.carbs_g, 0)} · F ${fmtNum(
-      meal.fat_g,
-      0
-    )} · ${fmtNum(meal.calories_kcal, 0)} kcal`;
-    row.innerHTML = `
-      <span class="meal-row-time">${esc(fmtTs(meal.ts))}</span>
-      <span class="meal-row-desc">${esc(meal.description || "Mahlzeit")}</span>
-      <span class="meal-row-macros">${esc(macros)}</span>
-    `;
-    list.appendChild(row);
+  groupMealsByDay(meals).forEach((group) => {
+    const kcalSum = group.meals.reduce((a, m) => a + (m.calories_kcal || 0), 0);
+    const heading = document.createElement("h4");
+    heading.className = "day-group-heading";
+    heading.textContent = `${fmtDate(group.day)} — ${group.meals.length} Mahlzeit${
+      group.meals.length === 1 ? "" : "en"
+    }, ${fmtNum(kcalSum, 0)} kcal`;
+    list.appendChild(heading);
+
+    group.meals.forEach((meal) => {
+      const row = document.createElement("article");
+      row.className = "meal-row stagger";
+      const macros = `P ${fmtNum(meal.protein_g, 0)} · C ${fmtNum(meal.carbs_g, 0)} · F ${fmtNum(
+        meal.fat_g,
+        0
+      )} · ${fmtNum(meal.calories_kcal, 0)} kcal`;
+      row.innerHTML = `
+        <span class="meal-row-time">${esc(fmtTime(meal.ts))}</span>
+        <span class="meal-row-desc">${esc(meal.description || "Mahlzeit")}</span>
+        <span class="meal-row-macros">${esc(macros)}</span>
+      `;
+      list.appendChild(row);
+    });
   });
 }
 
