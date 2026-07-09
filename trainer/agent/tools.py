@@ -8,7 +8,10 @@ die Implementierung (Dispatch passiert in `trainer.agent.core`).
 
 from __future__ import annotations
 
+import os
+import shutil
 import sqlite3
+import subprocess
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -442,6 +445,75 @@ def search_memories(query: str | None = None, category: str | None = None) -> di
         return {"memory_count": len(rows), "memories": _rows_to_dicts(rows)}
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# query_notebooklm (Live-Abfrage der Jeff-Nippard-NotebookLM-Notebooks)
+# ---------------------------------------------------------------------------
+
+# 10 Notebooks à ~50 Videos, chronologisch NEUESTE ZUERST gescraped: Notebook 1
+# = die 50 aktuellsten Jeff-Nippard-Videos (aktueller Wissensstand), Notebook 10
+# = seine ältesten (~2014/2015, teils durch neuere Ansichten überholt). Bei
+# widersprüchlichen Antworten zählt das niedriger nummerierte Notebook.
+NOTEBOOKLM_NOTEBOOKS: dict[str, dict[str, str]] = {
+    "1": {"id": "a0df019a-00d1-4c4f-afa1-301b0e17ffb9", "label": "Videos 1–50 (neueste)"},
+    "2": {"id": "95212155-6c59-4bba-a434-81aad742c8ee", "label": "Videos 51–100"},
+    "3": {"id": "0f8d62c1-950a-4668-bd4b-c259064304fa", "label": "Videos 101–150"},
+    "4": {"id": "8b052de3-27ea-4989-8da2-928b1d3842de", "label": "Videos 151–200"},
+    "5": {"id": "fd66bab9-9b55-44a8-ae08-db2da265df3b", "label": "Videos 201–250"},
+    "6": {"id": "c6b8bf86-718e-4b4f-a205-0e0da24f00bc", "label": "Videos 251–300"},
+    "7": {"id": "64057c92-e142-4d67-9fae-ed96453a9b52", "label": "Videos 301–350"},
+    "8": {"id": "ff6e1de5-6da9-4b5a-b335-330a8dc6eaa1", "label": "Videos 351–400"},
+    "9": {"id": "8c7c1747-01f7-4748-822c-6276d583b211", "label": "Videos 401–450"},
+    "10": {"id": "7f2c88bc-754d-4c9f-8ed3-4d43adfd2897", "label": "Videos 451–485 (älteste)"},
+}
+
+
+def query_notebooklm(question: str, notebook: str = "1") -> dict[str, Any]:
+    """Fragt live eines der 10 Jeff-Nippard-NotebookLM-Notebooks (~452 Videos
+    gesamt, siehe NOTEBOOKLM_NOTEBOOKS) über die `nlm`-CLI ab und liefert eine
+    mit [N]-Quellenangaben zitierte Antwort. `notebook` ist "1" (neueste 50
+    Videos, Standard) bis "10" (älteste). Braucht `nlm login` (separates
+    Read-Auth-Profil) — bei fehlendem/abgelaufenem Login kommt ein Fehler."""
+    meta = NOTEBOOKLM_NOTEBOOKS.get(str(notebook))
+    if meta is None:
+        return {"error": f"Unbekanntes Notebook '{notebook}' — gültig sind '1' bis '10'."}
+
+    nlm_bin = shutil.which("nlm")
+    if nlm_bin is None:
+        home = Path.home()
+        candidate = home / ".local" / "bin" / "nlm"
+        nlm_bin = str(candidate) if candidate.is_file() else None
+    if nlm_bin is None:
+        return {"error": "nlm-CLI nicht gefunden (nicht installiert oder nicht im PATH)."}
+
+    try:
+        proc = subprocess.run(
+            [nlm_bin, "notebook", "query", meta["id"], question, "--json", "--timeout", "60"],
+            capture_output=True,
+            text=True,
+            timeout=70,
+            env={**os.environ, "PATH": f"{Path(nlm_bin).parent}:{os.environ.get('PATH', '')}"},
+        )
+    except subprocess.TimeoutExpired:
+        return {"error": "Zeitüberschreitung bei der NotebookLM-Abfrage (>70s)."}
+
+    if proc.returncode != 0:
+        return {"error": f"nlm-Fehler: {proc.stderr.strip() or proc.stdout.strip()}"}
+
+    try:
+        import json as _json
+
+        parsed = _json.loads(proc.stdout)
+    except ValueError:
+        return {"error": "Antwort von nlm konnte nicht als JSON gelesen werden."}
+
+    return {
+        "notebook": notebook,
+        "notebook_label": meta["label"],
+        "question": question,
+        "answer": parsed.get("answer", ""),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1489,6 +1561,38 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "query_notebooklm",
+        "description": (
+            "Fragt LIVE eines von 10 NotebookLM-Notebooks mit ~452 Jeff-Nippard-"
+            "YouTube-Videos ab (Trainingswissenschaft, Hypertrophie, Ernährung, "
+            "Mobility/Stretching etc.), liefert eine mit [N]-Quellen zitierte "
+            "Antwort. Notebook '1' (Standard) = die 50 NEUESTEN Videos = aktueller "
+            "Wissensstand; '10' = älteste (~2014/2015, teils überholt) — bei "
+            "Widerspruch zählt die niedrigere Notebook-Nummer. Ein Grundwissen ist "
+            "bereits über search_memories (Kategorien training/nutrition/mobility) "
+            "und search_notes/read_note (Obsidian-Notiz 'Trainingsprotokoll (Jeff "
+            "Nippard)') verfügbar — nutze DIESES Tool nur für Detailfragen, die "
+            "darüber hinausgehen. WICHTIG: Bevor du dieses Tool aufrufst, sag "
+            "Manuel kurz, dass du live in NotebookLM nachschaust (z.B. 'Lass mich "
+            "kurz in Jeffs Videos nachschauen …') — außer er hat explizit gesagt, "
+            "dass du direkt nachschauen sollst."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "Die Frage an das Notebook, möglichst spezifisch.",
+                },
+                "notebook": {
+                    "type": "string",
+                    "description": "'1' (neueste, Standard) bis '10' (älteste).",
+                },
+            },
+            "required": ["question"],
+        },
+    },
+    {
         "name": "get_calendar",
         "description": (
             "Liest Manuels Kalender (read-only, ggf. mehrere Google-Kalender) für "
@@ -1888,6 +1992,7 @@ TOOL_FUNCTIONS: dict[str, Callable[..., dict[str, Any]]] = {
     "get_meals": get_meals,
     "save_memory": save_memory,
     "search_memories": search_memories,
+    "query_notebooklm": query_notebooklm,
     "get_calendar": get_calendar,
     "search_notes": search_notes,
     "read_note": read_note,
