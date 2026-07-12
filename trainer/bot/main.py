@@ -20,7 +20,8 @@ import sys
 from pathlib import Path
 
 from telegram import Update
-from telegram.constants import ChatAction
+from telegram.constants import ChatAction, ParseMode
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -41,7 +42,21 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TMP_DIR = Path("/private/tmp")
+# Telegrams HARTE Obergrenze pro Nachricht — wird nie überschritten, dient nur
+# als allerletzter Not-Schnitt, falls im ganzen Chunk keine gute Trennstelle
+# (Absatz/Zeile/Wort) gefunden wird.
 TELEGRAM_MAX_LEN = 4096
+# Weicher Ziel-Schnittpunkt, deutlich unter TELEGRAM_MAX_LEN: der Bot schneidet
+# lieber etwas früher an einer sauberen Stelle (Absatz > Zeile > Wortgrenze),
+# statt das harte Limit zu riskieren und mitten im Wort oder mitten in einer
+# **fett**-Markierung zu landen (das hätte mit aktiviertem Markdown-Parsing
+# sonst "Can't parse entities" zur Folge und der Chunk würde verschluckt).
+TELEGRAM_SPLIT_TARGET = 3500
+
+# Isa/Assistant schreiben **bold** (CommonMark-Stil, siehe app.js
+# renderInlineMarkdown fürs Web-UI — gleiche Konvention überall). Telegrams
+# klassischer Markdown-Modus erwartet dagegen *bold* mit EINEM Stern.
+_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
 
 START_MESSAGES: dict[str, str] = {
     "isa": (
@@ -82,13 +97,52 @@ async def _reject_if_unauthorized(update: Update) -> bool:
     return True
 
 
+def _split_for_telegram(text: str) -> list[str]:
+    """Teilt `text` in Telegram-sichere Chunks — bevorzugt an einer sauberen
+    Stelle (Absatz, sonst Zeile, sonst Wortgrenze) NAHE TELEGRAM_SPLIT_TARGET,
+    nie später als TELEGRAM_MAX_LEN. So wird proaktiv vor dem harten Limit
+    geschnitten, statt es zu erreichen — und nie mitten im Wort oder mitten in
+    einer **fett**-Markierung, die sonst beim Markdown-Parsing brechen würde.
+    """
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > TELEGRAM_MAX_LEN:
+        window = remaining[:TELEGRAM_SPLIT_TARGET]
+        split_at = window.rfind("\n\n")
+        if split_at < TELEGRAM_SPLIT_TARGET * 0.5:
+            split_at = window.rfind("\n")
+        if split_at < TELEGRAM_SPLIT_TARGET * 0.5:
+            split_at = window.rfind(" ")
+        if split_at < TELEGRAM_SPLIT_TARGET * 0.5:
+            split_at = TELEGRAM_MAX_LEN  # keine brauchbare Trennstelle -> harter Schnitt
+        chunks.append(remaining[:split_at].rstrip())
+        remaining = remaining[split_at:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+def _to_telegram_markdown(text: str) -> str:
+    return _BOLD_RE.sub(r"*\1*", text)
+
+
 async def _send_long_message(update: Update, text: str) -> None:
     if update.message is None:
         return
     if not text:
         return
-    for i in range(0, len(text), TELEGRAM_MAX_LEN):
-        await update.message.reply_text(text[i : i + TELEGRAM_MAX_LEN])
+    for chunk in _split_for_telegram(text):
+        try:
+            await update.message.reply_text(
+                _to_telegram_markdown(chunk), parse_mode=ParseMode.MARKDOWN
+            )
+        except BadRequest:
+            # Unbalancierte Markdown-Zeichen (z.B. ein einzelnes "*" in Isas
+            # Text, das nicht als Formatierung gemeint war) dürfen die
+            # Nachricht nicht verschlucken — lieber unformatiert zustellen
+            # als den Chunk stillschweigend zu verlieren.
+            logger.warning("Telegram-Markdown ungültig, sende Chunk unformatiert nach")
+            await update.message.reply_text(chunk)
 
 
 def _agent_name(context: ContextTypes.DEFAULT_TYPE) -> str:
