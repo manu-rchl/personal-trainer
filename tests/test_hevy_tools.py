@@ -147,7 +147,15 @@ def _require_hevy_key():
 
 def test_update_hevy_routine_preserves_unspecified_fields(monkeypatch):
     """Nur title angegeben -> notes/exercises müssen aus dem GET übernommen
-    werden, sonst würde Hevys PUT (Full-Replace) sie auf null/leer setzen."""
+    werden, sonst würde Hevys PUT (Full-Replace) sie auf null/leer setzen.
+
+    GET-Response nutzt hier absichtlich die REALE Hevy-Form (mit `index` auf
+    Exercise- UND Set-Ebene, `title` auf Exercise-Ebene, leerer `notes`-
+    String) — live gegen die echte API verifiziert (2026-07): genau diese
+    Felder lehnt PUT /v1/routines/{id} mit 400 ab, wenn man die GET-Response
+    unverändert zurückschickt. Reproduziert den Bug, bei dem ein reiner
+    Notes-/Titel-Update ohne eigene `exercises` fehlschlug.
+    """
     _require_hevy_key()
 
     get_response = _FakeResponse(
@@ -155,8 +163,19 @@ def test_update_hevy_routine_preserves_unspecified_fields(monkeypatch):
             "routine": {
                 "id": "r1",
                 "title": "Old Title",
-                "notes": "Old notes",
-                "exercises": [{"exercise_template_id": "3BC06AD3", "sets": []}],
+                "exercises": [
+                    {
+                        "index": 0,
+                        "title": "Bicep Curl",
+                        "notes": "",
+                        "exercise_template_id": "3BC06AD3",
+                        "superset_id": None,
+                        "sets": [
+                            {"index": 0, "type": "normal", "reps": 10, "weight_kg": None}
+                        ],
+                        "rest_seconds": 90,
+                    }
+                ],
             }
         }
     )
@@ -174,24 +193,56 @@ def test_update_hevy_routine_preserves_unspecified_fields(monkeypatch):
     assert result["routine_id"] == "r1"
     sent = put_calls[0]["routine"]
     assert sent["title"] == "New Title"
-    assert sent["notes"] == "Old notes"
-    assert sent["exercises"] == [{"exercise_template_id": "3BC06AD3", "sets": []}]
+
+    sent_exercise = sent["exercises"][0]
+    assert "index" not in sent_exercise  # Hevy lehnt das ab (live verifiziert)
+    assert "title" not in sent_exercise  # dito
+    assert sent_exercise["notes"] is None  # "" -> None normalisiert
+    assert sent_exercise["exercise_template_id"] == "3BC06AD3"
+    assert sent_exercise["rest_seconds"] == 90
+    sent_set = sent_exercise["sets"][0]
+    assert "index" not in sent_set  # Hevy lehnt das ab (live verifiziert)
+    assert sent_set["reps"] == 10
+
+
+def test_match_hevy_exercises_passes_through_per_exercise_notes():
+    """Hevy speichert Notizen NUR pro Übung, nicht auf Routinen-/Workout-
+    Ebene (live verifiziert) — create_hevy_routine/update_hevy_routine/
+    update_hevy_workout müssen ein optionales `notes` pro exercises[]-Eintrag
+    ins exercise_template_id-Payload durchreichen."""
+    conn = _conn_with_templates()
+    payload, matched, unmatched = tools_module._match_hevy_exercises(
+        conn,
+        [
+            {"name": "Bicep Curl", "sets": 2, "reps": 10, "notes": "Zielgewicht 15kg"},
+            {"name": "Bicep Curl", "sets": 2, "reps": 10},  # ohne notes
+            {"name": "Bicep Curl", "sets": 2, "reps": 10, "notes": ""},  # leer -> weglassen
+        ],
+        include_rest_seconds=True,
+    )
+    assert not unmatched
+    assert payload[0]["notes"] == "Zielgewicht 15kg"
+    assert "notes" not in payload[1]
+    assert "notes" not in payload[2]
 
 
 def test_update_hevy_workout_replaces_exercises_when_given(monkeypatch):
     _require_hevy_key()
 
+    # GET /v1/workouts/{id} liefert das Objekt FLACH, NICHT unter einem
+    # "workout"-Schlüssel gewrappt (anders als GET /v1/routines/{id}!) —
+    # live gegen die echte Hevy-API verifiziert (2026-07). Ein früherer
+    # Test hier hatte fälschlich die gewrappte Form gemockt, passend zum
+    # damaligen Bug (_hevy_unwrap ergab dadurch immer {}).
     get_response = _FakeResponse(
         {
-            "workout": {
-                "id": "w1",
-                "title": "Old Workout",
-                "description": "Old desc",
-                "start_time": "2026-01-01T10:00:00Z",
-                "end_time": "2026-01-01T10:30:00Z",
-                "is_private": False,
-                "exercises": [],
-            }
+            "id": "w1",
+            "title": "Old Workout",
+            "description": "Old desc",
+            "start_time": "2026-01-01T10:00:00Z",
+            "end_time": "2026-01-01T10:30:00Z",
+            "is_private": False,
+            "exercises": [],
         }
     )
     monkeypatch.setattr(tools_module, "init_db", lambda: None)

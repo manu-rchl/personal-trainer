@@ -985,17 +985,51 @@ def _hevy_unwrap(data: dict[str, Any], key: str) -> dict[str, Any]:
     return obj
 
 
+def _strip_hevy_readonly_exercise_fields(
+    exercises: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Entfernt aus GET-Response-Exercises die Felder, die Hevys PUT-Validator
+    ablehnt (server-generiert/read-only) — live verifiziert (2026-07) gegen
+    PUT /v1/routines/{id} und PUT /v1/workouts/{id}:
+
+    - Exercise-Ebene: `index` ("... is not allowed"), `title` (dito — der
+      Titel wird serverseitig aus `exercise_template_id` abgeleitet).
+    - Set-Ebene: `index`.
+    - Leere Strings bei `notes` UND (auf Workout-Ebene) `description` werden
+      ebenfalls von Hevy abgelehnt ("... is not allowed to be empty") — auf
+      `None` normalisieren statt "" durchzureichen.
+
+    Nötig immer dann, wenn eine unveränderte GET-Response 1:1 in einem PUT
+    wiederverwendet wird (z.B. bei einem Update, das nur `notes`/`title`
+    ändert und `exercises` unangetastet lassen soll) — genau das schlug vorher
+    mit 400 fehl, weil die GET-Form nicht die PUT-akzeptierte Form ist.
+    """
+    cleaned = []
+    for ex in exercises:
+        ex2 = {k: v for k, v in ex.items() if k not in ("index", "title")}
+        if ex2.get("notes") == "":
+            ex2["notes"] = None
+        ex2["sets"] = [
+            {k: v for k, v in s.items() if k != "index"} for s in ex.get("sets", [])
+        ]
+        cleaned.append(ex2)
+    return cleaned
+
+
 def _match_hevy_exercises(
     conn: sqlite3.Connection,
     exercises: list[dict[str, Any]],
     *,
     include_rest_seconds: bool,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
-    """Matched rohe {name, sets, reps, rest_seconds?}-Einträge gegen den Hevy-
-    Übungskatalog und baut die Exercise-Payload (exercise_template_id + sets).
+    """Matched rohe {name, sets, reps, rest_seconds?, notes?}-Einträge gegen
+    den Hevy-Übungskatalog und baut die Exercise-Payload (exercise_template_id
+    + sets + optionale Felder).
 
     `rest_seconds` nur anhängen, wenn `include_rest_seconds` — Routinen kennen
-    das Feld, Workout-Exercises (PostWorkoutsRequestExercise) nicht.
+    das Feld, Workout-Exercises (PostWorkoutsRequestExercise) nicht. `notes`
+    ist pro Übung optional (Hevy speichert Notizen NUR pro Übung, nicht pro
+    Routine/Workout — live verifiziert, siehe update_hevy_routine).
     """
     templates = [
         dict(r)
@@ -1032,6 +1066,9 @@ def _match_hevy_exercises(
             rest_seconds = ex.get("rest_seconds")
             if rest_seconds is not None:
                 exercise_payload["rest_seconds"] = rest_seconds
+        notes = ex.get("notes")
+        if notes:  # leere Strings nicht senden -- Hevy lehnt "" ab (siehe oben)
+            exercise_payload["notes"] = notes
         payload_exercises.append(exercise_payload)
 
     return payload_exercises, matched, unmatched
@@ -1127,8 +1164,24 @@ def update_hevy_routine(
     Holt zuerst den aktuellen Stand per GET, damit nicht angegebene Felder
     unverändert bleiben — Hevys PUT ersetzt das komplette Routine-Objekt.
     `exercises`, falls angegeben, ERSETZT alle Übungen komplett (gleiche
-    Fuzzy-Match-Logik wie bei `create_hevy_routine`; nicht gematchte Namen
-    werden nicht geraten, sondern als "unmatched" zurückgegeben).
+    Fuzzy-Match-Logik wie bei `create_hevy_routine`, jetzt inkl. optionalem
+    `notes` PRO Übung — siehe `_match_hevy_exercises`). Nicht gematchte Namen
+    werden nicht geraten, sondern als "unmatched" zurückgegeben.
+
+    Wichtig (live verifiziert, 2026-07): Hevys Routine-Objekt hat GAR KEIN
+    eigenes `notes`-Feld auf Routinen-Ebene (GET liefert nur id/title/
+    folder_id/updated_at/created_at/exercises) — Hevy nimmt den `notes`-Wert
+    im PUT-Body klaglos an, speichert ihn aber nirgends. Der `notes`-Parameter
+    hier ist also aktuell folgenlos; echte Notizen funktionieren NUR pro
+    Übung (`exercises[].notes`). Bleibt vorerst erhalten (harmlos, kein
+    Fehler), falls Hevy das Feld später unterstützt.
+
+    Der GET-Response-Fallback für unveränderte Übungen (wenn `exercises`
+    nicht angegeben wird) muss vor dem PUT bereinigt werden: GET liefert
+    Felder (`index`, `title`, leere `notes`-Strings), die der PUT-Validator
+    ablehnt (400) — siehe `_strip_hevy_readonly_exercise_fields`. Das war der
+    Bug, der einen reinen Notes-/Titel-Update ohne `exercises` bisher mit 400
+    hat scheitern lassen.
     """
     if not config.hevy_api_key:
         return {"error": "Hevy ist nicht konfiguriert (HEVY_API_KEY fehlt)."}
@@ -1162,7 +1215,9 @@ def update_hevy_routine(
                 "unmatched": unmatched,
             }
     else:
-        payload_exercises = current.get("exercises", [])
+        payload_exercises = _strip_hevy_readonly_exercise_fields(
+            current.get("exercises", [])
+        )
 
     routine_body = {
         "title": title if title is not None else current.get("title"),
@@ -1201,7 +1256,17 @@ def update_hevy_workout(
     nur für source='hevy' gesetzt — bei Chat-geloggten Workouts existiert kein
     Hevy-Pendant). Holt zuerst den aktuellen Stand per GET, damit nicht
     angegebene Felder unverändert bleiben. `exercises`, falls angegeben,
-    ERSETZT alle Übungen komplett.
+    ERSETZT alle Übungen komplett (inkl. optionalem `notes` pro Übung).
+
+    Wichtig (live verifiziert, 2026-07): GET /v1/workouts/{id} liefert das
+    Workout-Objekt FLACH, NICHT unter einem "workout"-Schlüssel gewrappt
+    (anders als bei Routinen!). `_hevy_unwrap(get_resp.json(), "workout")` auf
+    diese Antwort ergab früher deshalb immer `{}` — jedes Update ohne
+    explizite `exercises` hätte dadurch `exercises: []` sowie
+    `start_time`/`end_time`/`is_private` auf None/False zurückgesetzt und ans
+    echte Workout gePUTtet. War also nicht nur ein 400-Fehler-Bug wie bei
+    Routinen, sondern ein potenzieller stiller DATENVERLUST an echten
+    Trainingsdaten. Jetzt: rohe GET-Response direkt verwenden, kein Unwrap.
     """
     if not config.hevy_api_key:
         return {"error": "Hevy ist nicht konfiguriert (HEVY_API_KEY fehlt)."}
@@ -1216,7 +1281,9 @@ def update_hevy_workout(
     except httpx.HTTPError as exc:
         return {"error": f"Hevy-Workout {workout_id} nicht gefunden: {exc}"}
 
-    current = _hevy_unwrap(get_resp.json(), "workout")
+    # KEIN _hevy_unwrap hier -- GET /v1/workouts/{id} liefert das Objekt
+    # flach, nicht unter einem "workout"-Schlüssel (siehe Docstring oben).
+    current = get_resp.json()
 
     matched: list[dict[str, Any]] = []
     unmatched: list[str] = []
@@ -1235,11 +1302,16 @@ def update_hevy_workout(
                 "unmatched": unmatched,
             }
     else:
-        payload_exercises = current.get("exercises", [])
+        payload_exercises = _strip_hevy_readonly_exercise_fields(
+            current.get("exercises", [])
+        )
 
+    # Hevy lehnt eine leere description ("") mit 400 ab -- nur None oder ein
+    # echter String sind gültig (live verifiziert, wie bei exercises[].notes).
+    current_description = current.get("description") or None
     workout_body = {
         "title": title if title is not None else current.get("title"),
-        "description": description if description is not None else current.get("description"),
+        "description": description if description is not None else current_description,
         "start_time": current.get("start_time"),
         "end_time": current.get("end_time"),
         "is_private": current.get("is_private", False),
@@ -1824,6 +1896,14 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                                 "type": "integer",
                                 "description": "Optionale Satzpause in Sekunden.",
                             },
+                            "notes": {
+                                "type": "string",
+                                "description": (
+                                    "Optionale Notiz NUR für diese Übung (z.B. Zielgewicht, "
+                                    "Technik-Hinweis) — Hevy speichert Notizen pro Übung, "
+                                    "nicht auf Routinen-Ebene."
+                                ),
+                            },
                         },
                         "required": ["name", "sets"],
                     },
@@ -1835,11 +1915,17 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "update_hevy_routine",
         "description": (
-            "Bearbeitet eine bestehende Hevy-Routine (Titel, Notizen, Übungen). "
-            "Nicht angegebene Felder bleiben unverändert. `exercises`, falls "
-            "angegeben, ERSETZT alle Übungen der Routine komplett (gleiches "
-            "Fuzzy-Matching wie create_hevy_routine). Schreibt live in Hevy, "
-            "also nur nach klarer Absicht/Bestätigung von Manuel aufrufen."
+            "Bearbeitet eine bestehende Hevy-Routine (Titel, Übungen, "
+            "Übungs-Notizen). Nicht angegebene Felder bleiben unverändert. "
+            "`exercises`, falls angegeben, ERSETZT alle Übungen der Routine "
+            "komplett (gleiches Fuzzy-Matching wie create_hevy_routine, inkl. "
+            "optionalem `notes` pro Übung). Ohne `exercises` bleiben die "
+            "bestehenden Übungen unverändert erhalten (z.B. bei einem reinen "
+            "Titel-Update). HINWEIS: der `notes`-Parameter hier wirkt sich "
+            "NICHT sichtbar aus — Hevy hat kein Notizen-Feld auf Routinen-"
+            "Ebene, nur pro Übung (`exercises[].notes`). Schreibt live in "
+            "Hevy, also nur nach klarer Absicht/Bestätigung von Manuel "
+            "aufrufen."
         ),
         "input_schema": {
             "type": "object",
@@ -1849,7 +1935,14 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "description": "Die Hevy-Routine-ID (aus create_hevy_routine oder Manuel genannt).",
                 },
                 "title": {"type": "string", "description": "Neuer Titel (optional)."},
-                "notes": {"type": "string", "description": "Neue Notizen (optional)."},
+                "notes": {
+                    "type": "string",
+                    "description": (
+                        "Wird von Hevy angenommen, aber NICHT gespeichert (kein "
+                        "Routinen-Notizen-Feld) — für echte Notizen exercises[].notes "
+                        "nutzen."
+                    ),
+                },
                 "exercises": {
                     "type": "array",
                     "description": "Neue vollständige Übungsliste (ersetzt die alte, optional).",
@@ -1866,6 +1959,13 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                                 "type": "integer",
                                 "description": "Optionale Satzpause in Sekunden.",
                             },
+                            "notes": {
+                                "type": "string",
+                                "description": (
+                                    "Optionale Notiz NUR für diese Übung (z.B. Zielgewicht, "
+                                    "Technik-Hinweis)."
+                                ),
+                            },
                         },
                         "required": ["name", "sets"],
                     },
@@ -1878,12 +1978,13 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "name": "update_hevy_workout",
         "description": (
             "Bearbeitet ein bestehendes Hevy-Workout (Titel, Beschreibung, "
-            "Übungen). `workout_id` ist die `hevy_workout_id` aus get_workouts "
-            "(nur bei source='hevy' vorhanden — Chat-geloggte Workouts existieren "
-            "nicht in Hevy). Nicht angegebene Felder bleiben unverändert. "
-            "`exercises`, falls angegeben, ERSETZT alle Übungen komplett. "
-            "Schreibt live in Hevy, also nur nach klarer Absicht/Bestätigung "
-            "von Manuel aufrufen."
+            "Übungen, Übungs-Notizen). `workout_id` ist die `hevy_workout_id` "
+            "aus get_workouts (nur bei source='hevy' vorhanden — Chat-"
+            "geloggte Workouts existieren nicht in Hevy). Nicht angegebene "
+            "Felder bleiben unverändert. `exercises`, falls angegeben, "
+            "ERSETZT alle Übungen komplett (inkl. optionalem `notes` pro "
+            "Übung). Schreibt live in Hevy, also nur nach klarer Absicht/"
+            "Bestätigung von Manuel aufrufen."
         ),
         "input_schema": {
             "type": "object",
@@ -1906,6 +2007,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                             },
                             "sets": {"type": "integer", "description": "Anzahl Sätze."},
                             "reps": {"type": "integer", "description": "Wiederholungen pro Satz."},
+                            "notes": {
+                                "type": "string",
+                                "description": "Optionale Notiz NUR für diese Übung.",
+                            },
                         },
                         "required": ["name", "sets"],
                     },
