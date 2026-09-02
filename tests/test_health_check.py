@@ -19,6 +19,7 @@ def _fresh_state() -> dict:
         "hevy_last_sync": _epoch(NOW - timedelta(hours=10)),
         "oura_token_expires_at": _epoch(NOW + timedelta(days=20)),
         "bot_heartbeat": (NOW - timedelta(minutes=2)).isoformat(),
+        "post_workout_last_run": (NOW - timedelta(minutes=45)).isoformat(),
         "last_workout_date": (NOW - timedelta(days=2)).date().isoformat(),
     }
 
@@ -51,3 +52,10 @@ def test_empty_state_reports_never_ran():
     problems = evaluate({}, NOW)
     assert "Oura-Sync: noch nie gelaufen" in problems
     assert "Hevy-Sync: noch nie gelaufen" in problems
+    assert "Post-Workout-Job: noch nie gelaufen" in problems
+
+
+def test_stale_post_workout_job():
+    state = _fresh_state()
+    state["post_workout_last_run"] = (NOW - timedelta(hours=5)).isoformat()
+    assert any(p.startswith("Post-Workout-Job: letzter Lauf") for p in evaluate(state, NOW))

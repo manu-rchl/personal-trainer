@@ -1,0 +1,9 @@
+[Unit]
+Description=Trainer Morgen-Check-in
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/manuel/personal-trainer-manuel
+ExecStart=/root/.local/bin/uv run python -m trainer.jobs.morning_checkin
+StandardOutput=append:/root/manuel/personal-trainer-manuel/logs/morning-checkin.log
+StandardError=append:/root/manuel/personal-trainer-manuel/logs/morning-checkin.error.log

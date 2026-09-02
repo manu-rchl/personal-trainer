@@ -23,6 +23,8 @@ logger = logging.getLogger(__name__)
 
 TARGET_NOTE_PREFIX = "Ziel (Isa"
 MAX_NOTE_HISTORY_LINES = 1  # so viele alte Notizzeilen bleiben unter der neuen stehen
+# Jobs können das im Dry-Run abschalten (post_workout --no-hevy-write).
+HEVY_WRITE_ENABLED = True
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +182,9 @@ def set_routine_exercise_note(canon: str, template_id: str | None, note_line: st
 
     if not config.hevy_api_key:
         return {"error": "Hevy ist nicht konfiguriert (HEVY_API_KEY fehlt)."}
+    if not HEVY_WRITE_ENABLED:
+        logger.info("Hevy-Schreiben deaktiviert — Notiz für %s wäre: %s", canon, note_line)
+        return {"skipped": "Hevy-Schreiben deaktiviert (Dry-Run)", "note": note_line}
     try:
         routines = _fetch_routines()
     except httpx.HTTPError as exc:
@@ -330,7 +335,23 @@ def schedule_checkin(due_date: str, text: str) -> dict[str, Any]:
         conn.close()
 
 
+def clear_memory_review() -> dict[str, Any]:
+    """Markiert den offenen Memory-Review-Vorschlag als erledigt (nach Anwenden/Ablehnen)."""
+    conn = get_connection()
+    try:
+        cur = conn.execute("DELETE FROM sync_state WHERE key = 'memory_review_pending'")
+        conn.commit()
+        return {"status": "erledigt" if cur.rowcount else "kein offener Review"}
+    finally:
+        conn.close()
+
+
 COACH_TOOL_SCHEMAS: list[dict[str, Any]] = [
+    {
+        "name": "clear_memory_review",
+        "description": "Schließt den offenen Memory-Review-Vorschlag ab, nachdem du ihn angewendet oder Manuel ihn abgelehnt hat.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
     {
         "name": "get_exercise_progress",
         "description": (
@@ -446,6 +467,7 @@ COACH_TOOL_SCHEMAS: list[dict[str, Any]] = [
 ]
 
 COACH_TOOL_FUNCTIONS: dict[str, Any] = {
+    "clear_memory_review": clear_memory_review,
     "get_exercise_progress": get_exercise_progress,
     "get_muscle_frequency": get_muscle_frequency,
     "get_training_plan": get_training_plan,

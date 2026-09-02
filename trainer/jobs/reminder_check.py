@@ -33,6 +33,7 @@ from trainer.agent.core import persist_exchange
 from trainer.config import config
 from trainer.db import get_connection, init_db
 from trainer.ingest import hevy as hevy_ingest
+from trainer.jobs.agent_job import run_agent_job
 from trainer.jobs.notify import run_job, send_telegram
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,11 @@ DEFAULT_GYM_GOAL = 3
 GYM_GOAL_KEY = "gym_goal_per_week"
 LAST_REMINDER_KEY = "last_reminder_date"
 SYNTHETIC_USER_TURN = "[System: täglicher Reminder-Check 16:30]"
+
+REMINDER_INSTRUCTION = """[System: Gym-Reminder 16:30] Stand: {done}/{goal} Workouts diese Woche, noch {days} Tag(e) inkl. heute — es wird eng, heute wurde noch nicht trainiert.
+Prüfe get_calendar(days=1) und die Memories: Ist Manuel unterwegs (Stuttgart/Reise), krank oder ist ein Ruhetag sinnvoll (get_health_summary 2)? Dann schlag statt Gym etwas Passendes vor (Home-Workout, Mobility) oder antworte NO_MESSAGE, wenn ein Reminder heute keinen Sinn hat.
+Sonst: erinnere ihn kurz und konkret (2–4 Zeilen), am besten mit dem Trainingstag, der laut Plan dran ist, und dem Slot nach 17:30. Kein Vorwurf.
+Zur Orientierung, so hätte der alte Template-Text gelautet: "{fallback}\""""
 
 # 3 Varianten in Isas Ton, Auswahl nach Wochentag-Index (deterministisch,
 # damit nicht jeden Tag dieselbe Formulierung kommt).
@@ -154,20 +160,30 @@ def run(today: date | None = None) -> None:
             )
             return
 
-        text = build_reminder_text(
+        fallback = build_reminder_text(
             done=workouts_done,
             goal=goal,
             remaining=goal - workouts_done,
             days=7 - today.weekday(),
             weekday=today.weekday(),
         )
-        send_telegram(text)
+        # Ab jetzt (heute) nicht nochmal — auch wenn der Agent NO_MESSAGE sagt.
         _set_sync_state(conn, LAST_REMINDER_KEY, today_iso)
     finally:
         conn.close()
 
-    persist_exchange(SYNTHETIC_USER_TURN, text, agent="isa")
-    logger.info("Reminder gesendet: %s", text)
+    instruction = REMINDER_INSTRUCTION.format(
+        done=workouts_done, goal=goal, days=7 - today.weekday(), fallback=fallback
+    )
+    try:
+        sent = run_agent_job("reminder", instruction)
+    except Exception:
+        # Agent nicht verfügbar -> deterministischer Text, wie früher.
+        logger.exception("Agent-Reminder fehlgeschlagen, sende Template-Text")
+        send_telegram(fallback)
+        persist_exchange(SYNTHETIC_USER_TURN, fallback, agent="isa")
+        sent = fallback
+    logger.info("Reminder: %s", "gesendet" if sent else "vom Agenten unterdrückt (NO_MESSAGE)")
 
 
 if __name__ == "__main__":

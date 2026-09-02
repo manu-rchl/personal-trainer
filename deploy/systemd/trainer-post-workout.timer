@@ -1,0 +1,9 @@
+[Unit]
+Description=Trainer Post-Workout Check-in + Follow-ups (*-*-* 07..23:15:00)
+
+[Timer]
+OnCalendar=*-*-* 07..23:15:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

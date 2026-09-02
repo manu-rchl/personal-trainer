@@ -22,37 +22,16 @@ import sqlite3
 from datetime import date, timedelta
 from typing import Any
 
-import anthropic
-
 from trainer.agent.core import persist_exchange
-from trainer.config import config
 from trainer.db import get_connection, init_db
+from trainer.jobs.agent_job import run_agent_job
 from trainer.jobs.notify import run_job, send_telegram
 
 logger = logging.getLogger(__name__)
 
-MAX_TOKENS = 1200
 PREV_WEEKS = 4
 LAST_REPORT_KEY = "last_weekly_report_week"
 SYNTHETIC_USER_TURN = "[System: Wochenreport So 18:00]"
-
-SYSTEM_PROMPT = """Du bist "Isa", Manuels persönlicher Fitness-Trainer & Health-Coach.
-
-Ton: Direkt, motivierend, Kumpel-Ton (du duzt Manuel). Wissenschaftlich fundiert,
-aber keine Vorlesung. Du schreibst für Telegram: kurze Absätze, KEINE
-Markdown-Tabellen, sparsame Emojis (höchstens vereinzelt).
-
-Du bekommst unten einen Fakten-Block mit Kennzahlen der aktuellen Woche im
-Vergleich zum Durchschnitt der letzten 4 Wochen. Formuliere daraus einen
-kompakten Wochenreport mit drei Teilen:
-1. Kurzer Wochenüberblick (Schlaf, Recovery, Aktivität, Training, Ernährung)
-2. Was ist auffällig — Trends, Verbesserungen oder Verschlechterungen im
-   Vergleich zu den Vorwochen (Ups & Downs klar benennen)
-3. 1-2 konkrete, umsetzbare Änderungsempfehlungen für nächste Woche
-
-Nutze NUR die gegebenen Zahlen, erfinde nichts dazu. Wenn ein Wert fehlt
-(None/nicht vorhanden), erwähne das nicht explizit als Datenlücke, lass den
-Punkt einfach weg statt darüber zu lamentieren."""
 
 NO_DATA_MESSAGE = (
     "Hey, für diese Woche hab ich noch keine Oura-Daten gefunden – kann dir "
@@ -238,17 +217,21 @@ def build_facts_block(
 # ---------------------------------------------------------------------------
 
 
-def generate_report_text(facts_block: str) -> str:
-    """Genau EIN Anthropic-API-Call, KEINE Tools — formuliert Isas Wochenreport."""
-    client = anthropic.Anthropic(api_key=config.anthropic_api_key)
-    response = client.messages.create(
-        model=config.trainer_model,
-        max_tokens=MAX_TOKENS,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": facts_block}],
-    )
-    parts = [b.text for b in response.content if getattr(b, "type", None) == "text"]
-    return "\n".join(parts).strip()
+REPORT_INSTRUCTION = """[System: Wochenreport {week_key}] Hier die deterministischen Wochenzahlen:
+
+{facts}
+
+Bau daraus Manuels Wochenreport (Telegram-Stil, max. ~20 Zeilen):
+1. Wochenüberblick: Schlaf, Recovery, Aktivität, Training, Ernährung — mit Bezug auf die Vorwochen (Ups & Downs klar benennen).
+2. Ziel-Tracking: Gewicht Richtung 70 kg (get_profile, ggf. Body-Measurements/Memories), Protein-/Kalorienziel vs. geloggt, Trainingstage vs. Plan (get_training_plan).
+3. Kraft: rufe get_exercise_progress für die 3 wichtigsten Übungen der Woche auf (aus get_workouts(days=7)) und nenne e1RM-Trend/Plateaus; get_muscle_frequency(weeks=4) für den Frequenz-Check.
+4. Kontext: get_calendar(days=7) — Reisen/Termine nächste Woche berücksichtigen, statt pauschal mehr Training zu fordern.
+5. 1–2 konkrete Änderungen für nächste Woche, die in seinen Alltag passen.
+Nutze nur echte Zahlen, erfinde nichts; fehlende Werte einfach weglassen."""
+
+
+def build_report_instruction(facts_block: str, week_key: str) -> str:
+    return REPORT_INSTRUCTION.format(facts=facts_block, week_key=week_key)
 
 
 def _week_key(monday: date) -> str:
@@ -256,8 +239,8 @@ def _week_key(monday: date) -> str:
     return f"{iso_year}-W{iso_week:02d}"
 
 
-def run(reference: date | None = None, force: bool = False) -> None:
-    """Aggregiert, formuliert und verschickt den Wochenreport für die Woche um `reference`.
+def run(reference: date | None = None, force: bool = False, dry_run: bool = False) -> None:
+    """Aggregiert, formuliert (Agent-Turn mit Tools) und verschickt den Wochenreport.
 
     Dedupe über sync_state[LAST_REPORT_KEY] — der Report für dieselbe Woche
     ging früher zweimal raus, wenn der Job doppelt getriggert wurde.
@@ -281,14 +264,18 @@ def run(reference: date | None = None, force: bool = False) -> None:
         conn.close()
 
     if not has_oura_data(current):
-        text = NO_DATA_MESSAGE
         logger.warning("Keine Oura-Daten für %s — Hinweis-Nachricht statt Report.", week_key)
+        if dry_run:
+            print(NO_DATA_MESSAGE)
+        else:
+            send_telegram(NO_DATA_MESSAGE)
+            persist_exchange(SYNTHETIC_USER_TURN, NO_DATA_MESSAGE, agent="isa")
     else:
         facts_block = build_facts_block(current, previous, monday, sunday)
-        text = generate_report_text(facts_block)
+        run_agent_job("weekly-report", build_report_instruction(facts_block, week_key), dry_run=dry_run)
 
-    send_telegram(text)
-    persist_exchange(SYNTHETIC_USER_TURN, text, agent="isa")
+    if dry_run:
+        return
 
     conn = get_connection()
     try:
@@ -303,6 +290,16 @@ def run(reference: date | None = None, force: bool = False) -> None:
     logger.info("Wochenreport %s gesendet und in messages gespeichert.", week_key)
 
 
-if __name__ == "__main__":
+def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="python -m trainer.jobs.weekly_report")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--force", action="store_true", help="auch wenn diese Woche schon gesendet")
+    args = parser.parse_args()
     init_db()
-    run_job("weekly-report", run)
+    run_job("weekly-report", lambda: run(force=args.force, dry_run=args.dry_run))
+
+
+if __name__ == "__main__":
+    main()

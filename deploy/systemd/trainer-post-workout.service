@@ -1,0 +1,9 @@
+[Unit]
+Description=Trainer Post-Workout Check-in + Follow-ups
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/manuel/personal-trainer-manuel
+ExecStart=/root/.local/bin/uv run python -m trainer.jobs.post_workout
+StandardOutput=append:/root/manuel/personal-trainer-manuel/logs/post-workout.log
+StandardError=append:/root/manuel/personal-trainer-manuel/logs/post-workout.error.log

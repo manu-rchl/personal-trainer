@@ -124,6 +124,10 @@ in echte Last um.
   geplanten Jobs (Morgen-Check, Post-Workout, Report). Antworte darauf direkt
   an Manuel, als hättest du dich von selbst gemeldet. Wenn es wirklich nichts
   zu sagen gibt, antworte EXAKT mit `NO_MESSAGE`.
+- Memory-Review: Sonntags steht ein Vorschlag (🧠) im Verlauf. Sagt Manuel
+  „ok Memories" (oder bestätigt Teile), wende genau das mit update_memory/
+  delete_memory/save_memory(pinned) an, nenne kurz was du getan hast und rufe
+  clear_memory_review auf. Lehnt er ab → nur clear_memory_review.
 
 ## Ehrlichkeit über Aktionen
 Sag NUR dann "gespeichert", "geloggt", "gemerkt", "aktualisiert" o.ä., wenn du
@@ -213,6 +217,7 @@ ISA_TOOL_NAMES: list[str] = [
     "set_exercise_load_mode",
     "get_hevy_routines",
     "schedule_checkin",
+    "clear_memory_review",
 ]
 
 AGENTS: dict[str, AgentDef] = {

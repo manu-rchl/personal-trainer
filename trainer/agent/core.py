@@ -82,6 +82,75 @@ HISTORY_MIN = 30
 HISTORY_STEP = 10
 
 
+SUMMARY_MAX_CHARS = 3000
+SUMMARY_MAX_TOKENS = 500
+SUMMARY_SYSTEM = (
+    "Du fasst ältere Chat-Nachrichten zwischen Manuel und seiner Trainerin Isa zusammen, "
+    "damit Isa den Faden behält, wenn sie aus dem Kontext fallen. Behalte: offene Fragen, "
+    "Zusagen, Entscheidungen, Zahlen/Ziele, Stimmung/Umstände (Reise, krank), Dinge, die "
+    "Isa nachfragen wollte. Lass weg: Smalltalk, bereits erledigte Details. Deutsch, "
+    f"knappe Stichpunkte, maximal {SUMMARY_MAX_CHARS} Zeichen insgesamt (inkl. der "
+    "bisherigen Zusammenfassung, die du bei Bedarf verdichtest)."
+)
+
+
+def _summarize_dropped_messages(
+    conn: Any, agent: str, window_start_id: int | None
+) -> None:
+    """Fasst Nachrichten zusammen, die durch den Fenstersprung rausfallen (Phase 2).
+
+    Rollend: bestehende Summary + neu rausgefallene Nachrichten → neue Summary.
+    Fehler werden nur geloggt — die Historie funktioniert auch ohne Summary.
+    """
+    if window_start_id is None:
+        return
+    row = conn.execute(
+        "SELECT upto_message_id, summary FROM history_summaries WHERE agent = ?", (agent,)
+    ).fetchone()
+    upto = row["upto_message_id"] if row else 0
+    old_summary = row["summary"] if row else ""
+    dropped = conn.execute(
+        """
+        SELECT id, role, content FROM messages
+        WHERE agent = ? AND role IN ('user', 'assistant') AND id > ? AND id < ?
+        ORDER BY id
+        """,
+        (agent, upto, window_start_id),
+    ).fetchall()
+    if not dropped:
+        return
+    transcript = "\n".join(
+        f"{'Manuel' if r['role'] == 'user' else 'Isa'}: {r['content'][:1500]}" for r in dropped
+    )
+    prompt = (
+        (f"BISHERIGE ZUSAMMENFASSUNG:\n{old_summary}\n\n" if old_summary else "")
+        + f"NEU RAUSGEFALLENE NACHRICHTEN ({len(dropped)}):\n{transcript}\n\n"
+        "Gib die aktualisierte Gesamt-Zusammenfassung zurück."
+    )
+    try:
+        client = anthropic.Anthropic(api_key=config.anthropic_api_key, max_retries=2)
+        resp = client.messages.create(
+            model=config.trainer_model,
+            max_tokens=SUMMARY_MAX_TOKENS,
+            system=SUMMARY_SYSTEM,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        summary = "\n".join(b.text for b in resp.content if getattr(b, "type", None) == "text").strip()
+        if not summary:
+            return
+        summary = summary[:SUMMARY_MAX_CHARS]
+        conn.execute(
+            "INSERT INTO history_summaries (agent, upto_message_id, summary, updated_at) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT(agent) DO UPDATE SET upto_message_id = excluded.upto_message_id, "
+            "summary = excluded.summary, updated_at = excluded.updated_at",
+            (agent, dropped[-1]["id"], summary, datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+        logger.info("Historie zusammengefasst [%s]: %d Nachrichten bis #%d", agent, len(dropped), dropped[-1]["id"])
+    except Exception:
+        logger.exception("Historien-Zusammenfassung fehlgeschlagen [%s]", agent)
+
+
 def _load_history(agent: str) -> list[dict[str, Any]]:
     """Lädt die Historie NUR dieses Agenten als cache-stabiles Fenster."""
     conn = get_connection()
@@ -97,6 +166,17 @@ def _load_history(agent: str) -> list[dict[str, Any]]:
         offset = 0
         if total > HISTORY_MIN:
             offset = ((total - HISTORY_MIN) // HISTORY_STEP) * HISTORY_STEP
+
+        if offset > 0:
+            first = conn.execute(
+                """
+                SELECT id FROM messages
+                WHERE role IN ('user', 'assistant') AND agent = ?
+                ORDER BY id ASC LIMIT 1 OFFSET ?
+                """,
+                (agent, offset),
+            ).fetchone()
+            _summarize_dropped_messages(conn, agent, first["id"] if first else None)
 
         rows = conn.execute(
             """

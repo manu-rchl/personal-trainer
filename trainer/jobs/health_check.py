@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 MAX_SYNC_AGE = timedelta(hours=36)
 MAX_HEARTBEAT_AGE = timedelta(minutes=15)
+MAX_POST_WORKOUT_AGE = timedelta(hours=3)  # läuft stündlich 07-23 Uhr
 TOKEN_WARN_DAYS = 3
 WORKOUT_GAP_DAYS = 10
 
@@ -56,6 +57,8 @@ def _parse_iso(raw: str | None) -> datetime | None:
 
 def _age_text(delta: timedelta) -> str:
     hours = delta.total_seconds() / 3600
+    if hours < 2:
+        return f"{delta.total_seconds() / 60:.0f} min"
     if hours < 48:
         return f"{hours:.0f} h"
     return f"{hours / 24:.1f} Tage"
@@ -90,6 +93,12 @@ def evaluate(state: dict[str, Any], now: datetime) -> list[str]:
     elif now - hb > MAX_HEARTBEAT_AGE:
         problems.append(f"Bot: letzter Heartbeat vor {_age_text(now - hb)}")
 
+    pw = _parse_iso(state.get("post_workout_last_run"))
+    if pw is None:
+        problems.append("Post-Workout-Job: noch nie gelaufen")
+    elif now - pw > MAX_POST_WORKOUT_AGE:
+        problems.append(f"Post-Workout-Job: letzter Lauf vor {_age_text(now - pw)}")
+
     last_workout = state.get("last_workout_date")
     if last_workout:
         try:
@@ -108,8 +117,8 @@ def collect_state() -> dict[str, Any]:
         state: dict[str, Any] = {
             r["key"]: r["value"]
             for r in conn.execute(
-                "SELECT key, value FROM sync_state "
-                "WHERE key IN ('oura_last_sync', 'hevy_last_sync', 'bot_heartbeat')"
+                "SELECT key, value FROM sync_state WHERE key IN "
+                "('oura_last_sync', 'hevy_last_sync', 'bot_heartbeat', 'post_workout_last_run')"
             ).fetchall()
         }
         row = conn.execute(
