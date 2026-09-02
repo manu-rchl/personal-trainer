@@ -16,7 +16,6 @@ AGENTS_DIR="$HOME/Library/LaunchAgents"
 
 PLISTS=(
     com.manuel.trainer.bot.plist
-    com.manuel.trainer.assistant.plist
     com.manuel.trainer.oura-sync.plist
     com.manuel.trainer.hevy-sync.plist
     com.manuel.trainer.weekly-report.plist

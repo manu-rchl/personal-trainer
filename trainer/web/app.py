@@ -65,7 +65,7 @@ def _round(value: Any, ndigits: int = 1) -> Any:
 
 @app.get("/api/agents")
 def list_agents() -> list[dict[str, str]]:
-    """Verfügbare Agenten aus der Registry, in Registrierungsreihenfolge (isa, assistant)."""
+    """Verfügbare Agenten aus der Registry (aktuell nur isa)."""
     return [{"name": a.name, "display_name": a.display_name} for a in AGENTS.values()]
 
 

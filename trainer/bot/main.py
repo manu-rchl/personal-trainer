@@ -1,18 +1,15 @@
-"""Telegram-Bot-Einstiegspunkt für die Trainer-Agenten (Isa, Assistant).
+"""Telegram-Bot-Einstiegspunkt für den Trainer-Agenten Isa.
 
-Start: `uv run python -m trainer.bot.main [--agent isa|assistant]` (default: isa)
+Start: `uv run python -m trainer.bot.main`
 
 Long Polling, nur die in TELEGRAM_ALLOWED_CHAT_ID konfigurierte Chat-ID wird
-bedient. Textnachrichten gehen an den Tool-Use-Agenten (trainer.agent.core),
-.csv-Uploads werden über den bestehenden Strong-CSV-Importer (Phase 1)
-eingelesen (nur beim Isa-Bot).
+bedient. Text-, Foto- und Sprachnachrichten gehen an den Tool-Use-Agenten
+(trainer.agent.core).
 """
 
 from __future__ import annotations
 
-import argparse
 import asyncio
-import contextlib
 import io
 import logging
 import re
@@ -34,7 +31,6 @@ from trainer.agent.core import run_agent
 from trainer.agents import AgentDef, get_agent
 from trainer.bot.transcribe import transcribe_ogg
 from trainer.config import config
-from trainer.ingest.strong_csv import import_csv
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
@@ -53,31 +49,19 @@ TELEGRAM_MAX_LEN = 4096
 # sonst "Can't parse entities" zur Folge und der Chunk würde verschluckt).
 TELEGRAM_SPLIT_TARGET = 3500
 
-# Isa/Assistant schreiben **bold** (CommonMark-Stil, siehe app.js
-# renderInlineMarkdown fürs Web-UI — gleiche Konvention überall). Telegrams
-# klassischer Markdown-Modus erwartet dagegen *bold* mit EINEM Stern.
+# Isa schreibt **bold** (CommonMark-Stil, siehe app.js renderInlineMarkdown
+# fürs Web-UI — gleiche Konvention überall). Telegrams klassischer
+# Markdown-Modus erwartet dagegen *bold* mit EINEM Stern.
 _BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
 
-START_MESSAGES: dict[str, str] = {
-    "isa": (
-        "Hey, ich bin Isa – dein Trainer & Health-Coach.\n\n"
-        "Ich kann:\n"
-        "- Trainingsfragen beantworten (Übungen, Hypertrophie, Recovery, Ernährung)\n"
-        "- deine Oura- & Health-Daten auswerten (\"Wie war mein Schlaf diese Woche?\")\n"
-        "- Workouts loggen (\"Bankdrücken 3x8 80kg\")\n"
-        "- Strong-CSV-Exporte importieren (Datei einfach hier hochladen)\n\n"
-        "Leg los, schreib mir einfach."
-    ),
-    "assistant": (
-        "Hey, ich bin dein persönlicher Assistent.\n\n"
-        "Ich kann:\n"
-        "- Fragen zu deinem Kalender, Notizen und Health-Daten beantworten\n"
-        "- proaktiv mitdenken (Termine, offene Punkte, nächste Schritte)\n"
-        "- mir dauerhaft relevante Fakten über dich merken\n\n"
-        "Für Training & Ernährung schreib Isa – ich bin der Rest.\n"
-        "Leg los, schreib mir einfach."
-    ),
-}
+START_MESSAGE = (
+    "Hey, ich bin Isa – dein Trainer & Health-Coach.\n\n"
+    "Ich kann:\n"
+    "- Trainingsfragen beantworten (Übungen, Hypertrophie, Recovery, Ernährung)\n"
+    "- deine Oura- & Hevy-Daten auswerten (\"Wie war mein Schlaf diese Woche?\")\n"
+    "- Workouts und Mahlzeiten loggen (Text, Foto oder Sprachnachricht)\n\n"
+    "Leg los, schreib mir einfach."
+)
 
 UNAUTHORIZED_MESSAGE = "Dieser Bot ist privat eingerichtet und nicht für dich freigeschaltet."
 
@@ -154,7 +138,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if await _reject_if_unauthorized(update):
         return
     if update.message is not None:
-        await update.message.reply_text(START_MESSAGES[_agent_name(context)])
+        await update.message.reply_text(START_MESSAGE)
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -256,53 +240,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await _send_long_message(update, reply)
 
 
-def _parse_import_summary(stdout_text: str) -> str:
-    workouts_m = re.search(r"Workouts importiert:\s*(\d+)", stdout_text)
-    sets_m = re.search(r"S(?:ä|ae)tze importiert:\s*(\d+)", stdout_text)
-    skipped_m = re.search(r"Zeilen übersprungen.*?:\s*(\d+)", stdout_text)
-
-    if workouts_m and sets_m and skipped_m:
-        return (
-            f"{workouts_m.group(1)} Workouts, {sets_m.group(1)} Sätze importiert, "
-            f"{skipped_m.group(1)} Zeilen übersprungen."
-        )
-    # Fallback: rohe Ausgabe des Importers, falls das Format sich mal ändert.
-    return stdout_text.strip() or "Import abgeschlossen (keine Zusammenfassung verfügbar)."
-
-
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if await _reject_if_unauthorized(update):
-        return
-    message = update.message
-    document = message.document if message is not None else None
-    if document is None or not (document.file_name or "").lower().endswith(".csv"):
-        return
-
-    chat_id = update.effective_chat.id
-    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-
-    tmp_path = TMP_DIR / f"strong_import_{document.file_unique_id}.csv"
-    try:
-        tg_file = await context.bot.get_file(document.file_id)
-        await tg_file.download_to_drive(custom_path=tmp_path)
-
-        buf = io.StringIO()
-        try:
-            with contextlib.redirect_stdout(buf):
-                import_csv(tmp_path)
-        except SystemExit:
-            # import_csv beendet sich per sys.exit(1) bei fehlenden Pflichtspalten.
-            pass
-
-        summary = _parse_import_summary(buf.getvalue())
-        await message.reply_text(summary)
-    except Exception as exc:
-        logger.exception("CSV-Import fehlgeschlagen")
-        await message.reply_text(f"Da ist was schiefgelaufen beim Import: {exc}")
-    finally:
-        tmp_path.unlink(missing_ok=True)
-
-
 def build_application(agent_def: AgentDef) -> Application:
     if not agent_def.token:
         raise RuntimeError(
@@ -313,29 +250,14 @@ def build_application(agent_def: AgentDef) -> Application:
     app = Application.builder().token(agent_def.token).build()
     app.bot_data["agent_def"] = agent_def
     app.add_handler(CommandHandler("start", start_command))
-    if agent_def.name == "isa":
-        # CSV-Import (Strong-Export) ist ausschließlich Isas Job.
-        app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     return app
 
 
-def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Startet einen Trainer-Telegram-Bot.")
-    parser.add_argument(
-        "--agent",
-        choices=["isa", "assistant"],
-        default="isa",
-        help="Welcher Agent bedient diesen Bot (default: isa).",
-    )
-    return parser.parse_args(argv)
-
-
 def main() -> None:
-    args = _parse_args()
-    agent_def = get_agent(args.agent)
+    agent_def = get_agent("isa")
 
     try:
         app = build_application(agent_def)

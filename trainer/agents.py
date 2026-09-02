@@ -1,11 +1,10 @@
-"""Agent-Registry: definiert die verfügbaren Agenten (Isa, Assistant).
+"""Agent-Registry: definiert den Trainer-Agenten (Isa).
 
-Jeder Agent hat einen eigenen System-Prompt, ein eigenes Tool-Subset (Namen,
-die gegen `trainer.agent.tools.TOOL_SCHEMAS`/`TOOL_FUNCTIONS` gefiltert
-werden) und einen eigenen Telegram-Bot-Token (Config-Attributname). Die
-Chat-Historie (Tabelle `messages`) wird pro Agent getrennt gehalten
-(Spalte `agent`); das Langzeit-Gedächtnis (`memories`) bleibt bewusst
-GETEILT zwischen allen Agenten.
+Ein Agent hat einen System-Prompt, ein Tool-Subset (Namen, die gegen
+`trainer.agent.tools.TOOL_SCHEMAS`/`TOOL_FUNCTIONS` gefiltert werden) und
+einen Telegram-Bot-Token (Config-Attributname). Die Registry-Struktur bleibt
+erhalten, obwohl es seit 2026-09 nur noch Isa gibt (der frühere "assistant"
+wurde entfernt): `messages.agent` trennt die Historie weiterhin pro Agent.
 """
 
 from __future__ import annotations
@@ -17,16 +16,14 @@ from trainer.config import config
 DB_SCHEMA_OVERVIEW = """
 - oura_daily(date, kind, payload_json, sleep_score, readiness_score, activity_score,
   hrv_avg, resting_hr, sleep_duration_min, steps) — PRIMARY KEY (date, kind)
-- health_metrics(source, metric, ts, value, unit) — generische Apple-Health-Datenpunkte
-- workouts(id, date, type, source, notes, ext_id) — source ist 'hevy', 'chat', 'strong_csv'
-  (Altbestand) oder 'apple_health'; ext_id ist die native Hevy-Workout-ID (Dedupe)
+- workouts(id, date, type, source, notes, ext_id) — source ist 'hevy' (Sync) oder
+  'chat' (per Nachricht geloggt); ext_id ist die native Hevy-Workout-ID (Dedupe)
 - workout_sets(workout_id, exercise, set_no, reps, weight_kg)
 - hevy_exercise_templates(id, title, primary_muscle, equipment) — gecachter Hevy-Übungskatalog
 - profile(key, value) — Ziele, Gewicht, Präferenzen
-- messages(id, ts, role, content, agent) — Chat-Historie, getrennt pro Agent
-- sync_state(key, value) — interne Sync-Metadaten (nicht relevant für Trainer-Fragen)
-- memories(id, ts, category, content) — geteiltes Langzeit-Gedächtnis über Manuel
-  (siehe save_memory/search_memories, für alle Agenten sichtbar)
+- messages(id, ts, role, content, agent) — Chat-Historie
+- memories(id, ts, category, content) — Langzeit-Gedächtnis über Manuel
+  (siehe save_memory/search_memories)
 """.strip()
 
 
@@ -103,57 +100,6 @@ DB-Schema (SQLite):
 {schema}
 """
 
-ASSISTANT_SYSTEM_PROMPT_TEMPLATE = """Du bist Manuels persönlicher Assistent – sein Chief of Staff.
-
-Du kennst Manuels komplettes System: dieselben Daten wie Trainerin Isa (Health-
-und Trainingsdaten, Kalender, Obsidian-Notizen) sowie das geteilte
-Langzeit-Gedächtnis über Manuel, das du dir mit Isa teilst. Du bist der
-Generalist für alles außer Training und Ernährung – dafür ist Isa da. Wenn
-Manuel dich nach Workout-Logging, Ernährung/Mahlzeiten-Tracking oder
-Trainingsplanung fragt, verweise ihn kurz und freundlich an Isa, statt es
-selbst zu übernehmen.
-
-Ton: Direkt, kompakt, du duzt Manuel. Du schreibst für Telegram: kurze
-Absätze, KEINE Markdown-Tabellen, sparsame Emojis. Du denkst proaktiv mit –
-wenn du aus Kalender, Notizen oder Memories etwas Relevantes siehst
-(Terminkonflikt, offener Punkt, sinnvoller nächster Schritt), sprich es an,
-statt nur die gestellte Frage zu beantworten.
-
-Mit get_calendar siehst du Manuels Termine (Google Kalender, read-only). Mit
-search_notes und read_note kannst du in Manuels persönlichen Notizen
-(Obsidian) suchen. Mit search_memories/save_memory greifst du auf das mit Isa
-geteilte Langzeit-Gedächtnis über Manuel zu – speichere dort unaufgefordert
-neue, dauerhaft relevante Fakten, die im Gespräch auftauchen (keine
-Duplikate). Nur wenn die spezialisierten Tools nicht reichen, greif mit
-query_db (nur SELECT) direkt auf die DB zu.
-
-Der Obsidian-Vault ist Manuels "zweites Gehirn" – du hast dort auch
-Schreibzugriff (create_note/append_note/edit_note/delete_note) und sollst ihn
-PROAKTIV pflegen, ohne dass Manuel dich explizit dazu auffordern muss: Wenn im
-Gespräch strukturiertes, über eine einzelne Fakten-Notiz hinausgehendes Wissen
-entsteht (Projekt-Kontext, Entscheidungen, Recherchen, zusammenhängende
-Themen), leg dafür eine Notiz an oder erweitere eine bestehende – nach kurzer
-search_notes-Prüfung auf Duplikate. Halte den Vault aktuell: veraltete oder
-überholte Aussagen in bestehenden Notizen mit edit_note korrigieren statt
-stehen zu lassen; eindeutig obsolete Notizen mit delete_note entfernen (im
-Zweifel lieber fragen als löschen). save_memory bleibt für kurze, einzelne
-Fakten über Manuel; Notizen sind für zusammenhängendes, strukturiertes Wissen.
-
-Deine Spezialfähigkeit: Du kannst das System selbst weiterentwickeln
-(neue Features, Anbindungen, Änderungen an Isa oder dir). Der Ablauf ist
-ZWINGEND: (1) Manuels Wunsch verstehen, bei Unklarheit nachfragen.
-(2) Mit propose_dev_task einen präzisen, kontextfreien Entwicklungsauftrag
-formulieren und Manuel Titel + Kernpunkte zeigen. (3) NUR nach Manuels
-explizitem Ja run_dev_task aufrufen – niemals ohne Freigabe. (4) Claude Code
-arbeitet dann auf einem eigenen Git-Branch; du meldest dich automatisch,
-wenn es fertig ist (Status jederzeit mit check_dev_task). (5) Gemergt wird
-mit merge_dev_branch NUR, wenn Manuel es explizit sagt – danach erinnerst du
-ihn an den Bot-Neustart.
-
-DB-Schema (SQLite):
-{schema}
-"""
-
 # Dynamischer Kontext (Datum, Profil, Memories) wird als EIGENER System-Block
 # NACH dem Cache-Breakpoint gesendet (siehe trainer.agent.core), damit der
 # stabile Prompt-Teil oben byte-identisch bleibt und der Prompt-Cache greift.
@@ -162,7 +108,7 @@ DYNAMIC_CONTEXT_TEMPLATE = """Heutiges Datum: {today}
 Nutzerprofil (aktueller Stand):
 {profile}
 
-Was du bereits über Manuel weißt (Langzeit-Gedächtnis, geteilt zwischen den Agenten):
+Was du bereits über Manuel weißt (Langzeit-Gedächtnis):
 {memories}"""
 
 ISA_TOOL_NAMES: list[str] = [
@@ -193,31 +139,6 @@ ISA_TOOL_NAMES: list[str] = [
     "update_body_measurement",
 ]
 
-# Bewusst KEIN log_workout/log_meal — das ist Isas Job, siehe System-Prompt.
-ASSISTANT_TOOL_NAMES: list[str] = [
-    "get_health_summary",
-    "get_workouts",
-    "get_meals",
-    "get_calendar",
-    "get_profile",
-    "search_memories",
-    "save_memory",
-    "search_notes",
-    "read_note",
-    "create_note",
-    "append_note",
-    "edit_note",
-    "delete_note",
-    "query_db",
-    "update_profile",
-    "merge_exercises",
-    # Selbst-Erweiterung (von Manuel explizit freigegeben, 2026-07-07):
-    "propose_dev_task",
-    "run_dev_task",
-    "check_dev_task",
-    "merge_dev_branch",
-]
-
 AGENTS: dict[str, AgentDef] = {
     "isa": AgentDef(
         name="isa",
@@ -225,13 +146,6 @@ AGENTS: dict[str, AgentDef] = {
         system_prompt_template=ISA_SYSTEM_PROMPT_TEMPLATE,
         tool_names=ISA_TOOL_NAMES,
         token_config_attr="telegram_bot_token",
-    ),
-    "assistant": AgentDef(
-        name="assistant",
-        display_name="Assistant",
-        system_prompt_template=ASSISTANT_SYSTEM_PROMPT_TEMPLATE,
-        tool_names=ASSISTANT_TOOL_NAMES,
-        token_config_attr="assistant_bot_token",
     ),
 }
 

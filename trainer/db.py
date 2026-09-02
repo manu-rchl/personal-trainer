@@ -26,15 +26,6 @@ CREATE TABLE IF NOT EXISTS oura_daily (
     PRIMARY KEY (date, kind)
 );
 
-CREATE TABLE IF NOT EXISTS health_metrics (
-    source TEXT NOT NULL,
-    metric TEXT NOT NULL,
-    ts TEXT NOT NULL,
-    value REAL,
-    unit TEXT,
-    PRIMARY KEY (source, metric, ts)
-);
-
 CREATE TABLE IF NOT EXISTS workouts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     date TEXT,

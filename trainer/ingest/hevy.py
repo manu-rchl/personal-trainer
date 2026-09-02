@@ -1,13 +1,10 @@
 """Hevy API Ingestion — Workout-Sync + Exercise-Template-Cache.
 
-Hevy ist ab dieser Integration die EINZIGE Quelle für Workouts (siehe
-`migrate_from_strong`, die die alten `strong_csv`-Daten ersetzt, sobald der
-Backfill plausibel genug Workouts geliefert hat).
+Hevy ist die einzige Sync-Quelle für Workouts (daneben nur Chat-Logging).
 
 Usage:
     uv run python -m trainer.ingest.hevy sync [--full]
     uv run python -m trainer.ingest.hevy templates
-    uv run python -m trainer.ingest.hevy migrate-from-strong
 
 Auth: Header `api-key: <HEVY_API_KEY>` (kein OAuth, kein Bearer-Prefix).
 
@@ -45,10 +42,6 @@ DEFAULT_SYNC_PAGES = 2
 
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 2.0
-
-# Sicherheits-Schwelle für migrate_from_strong: wir erwarten ~60 Workouts,
-# darunter gilt der Backfill als unplausibel -> strong_csv bleibt erhalten.
-MIGRATION_MIN_WORKOUTS = 30
 
 
 # --------------------------------------------------------------------------
@@ -173,8 +166,7 @@ def upsert_hevy_workout(conn: sqlite3.Connection, workout: dict[str, Any]) -> st
     for exercise in workout.get("exercises", []) or []:
         exercise_name = exercise.get("title") or ""
         for idx, s in enumerate(exercise.get("sets", []) or []):
-            # Alle Sätze übernehmen (auch warmup) — Konsistenz mit Strong-Import,
-            # der ebenfalls nicht nach Satztyp filtert.
+            # Alle Sätze übernehmen (auch warmup) — kein Filter nach Satztyp.
             conn.execute(
                 """
                 INSERT INTO workout_sets (workout_id, exercise, set_no, reps, weight_kg)
@@ -298,72 +290,6 @@ def cache_templates() -> int:
 
 
 # --------------------------------------------------------------------------
-# Strong -> Hevy Umstellung (Hevy wird einzige Quelle)
-# --------------------------------------------------------------------------
-
-
-def migrate_from_strong() -> None:
-    """Ersetzt strong_csv-Workouts durch Hevy-Daten — NUR wenn der Backfill plausibel war.
-
-    Reihenfolge (zwingend, sicherheitskritisch):
-    1. Voller Hevy-Backfill (sync(full=True)).
-    2. COUNT(workouts WHERE source='hevy') >= MIGRATION_MIN_WORKOUTS prüfen.
-    3. NUR dann: DELETE workouts + workout_sets WHERE source='strong_csv'.
-
-    Liefert der Backfill weniger Workouts (oder fehlt der Key), wird NICHTS
-    gelöscht — strong_csv bleibt als Fallback erhalten.
-    """
-    _require_api_key()
-
-    print("Starte vollständigen Hevy-Backfill (alle Seiten)...")
-    result = sync(full=True)
-    print(
-        f"Backfill fertig: {result['inserted']} neu, {result['updated']} aktualisiert, "
-        f"{result['pages_fetched']} Seite(n)."
-    )
-
-    init_db()
-    conn = get_connection()
-    try:
-        hevy_count = conn.execute(
-            "SELECT COUNT(*) AS n FROM workouts WHERE source = 'hevy'"
-        ).fetchone()["n"]
-        print(f"Hevy-Workouts in DB nach Backfill: {hevy_count}")
-
-        if hevy_count < MIGRATION_MIN_WORKOUTS:
-            print(
-                f"ABBRUCH: nur {hevy_count} Hevy-Workouts (< {MIGRATION_MIN_WORKOUTS} "
-                "erwartet). strong_csv bleibt UNVERÄNDERT erhalten. Bitte manuell prüfen, "
-                "bevor migrate-from-strong erneut versucht wird.",
-                file=sys.stderr,
-            )
-            return
-
-        strong_ids = [
-            r["id"]
-            for r in conn.execute(
-                "SELECT id FROM workouts WHERE source = 'strong_csv'"
-            ).fetchall()
-        ]
-        if not strong_ids:
-            print("Keine strong_csv-Workouts vorhanden — nichts zu löschen.")
-            return
-
-        placeholders = ",".join("?" for _ in strong_ids)
-        conn.execute(
-            f"DELETE FROM workout_sets WHERE workout_id IN ({placeholders})", strong_ids
-        )
-        conn.execute("DELETE FROM workouts WHERE source = 'strong_csv'")
-        conn.commit()
-        print(
-            f"strong_csv-Workouts gelöscht ({len(strong_ids)} Workouts + zugehörige Sätze). "
-            "Hevy ist jetzt die einzige Workout-Quelle."
-        )
-    finally:
-        conn.close()
-
-
-# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
@@ -380,10 +306,6 @@ def main() -> None:
     )
 
     sub.add_parser("templates", help="Exercise-Templates cachen")
-    sub.add_parser(
-        "migrate-from-strong",
-        help="Strong-CSV-Workouts durch Hevy ersetzen (Backfill + Sicherheits-Guard)",
-    )
 
     args = parser.parse_args()
 
@@ -396,8 +318,6 @@ def main() -> None:
     elif args.command == "templates":
         count = cache_templates()
         print(f"Fertig. {count} Exercise-Templates gecached.")
-    elif args.command == "migrate-from-strong":
-        migrate_from_strong()
 
 
 if __name__ == "__main__":

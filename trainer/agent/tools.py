@@ -55,7 +55,7 @@ def _round(value: Any, ndigits: int = 1) -> Any:
 
 
 def get_health_summary(days: int = 7) -> dict[str, Any]:
-    """Aggregierte Oura-Kennzahlen + health_metrics-Übersicht der letzten `days` Tage."""
+    """Aggregierte Oura-Kennzahlen (Schnitt/Min/Max + Tagesreihe) der letzten `days` Tage."""
     init_db()
     conn = get_connection()
     try:
@@ -104,23 +104,11 @@ def get_health_summary(days: int = 7) -> dict[str, Any]:
             (cutoff,),
         ).fetchall()
 
-        metrics_rows = conn.execute(
-            """
-            SELECT metric, COUNT(*) AS n, MIN(ts) AS first_ts, MAX(ts) AS last_ts
-            FROM health_metrics
-            WHERE ts >= ?
-            GROUP BY metric
-            ORDER BY metric
-            """,
-            (cutoff,),
-        ).fetchall()
-
         return {
             "period_days": days,
             "since": cutoff,
             "oura_aggregates": aggregates,
             "oura_daily": _rows_to_dicts(daily_rows),
-            "health_metrics_counts": _rows_to_dicts(metrics_rows),
         }
     finally:
         conn.close()
@@ -1450,7 +1438,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "description": (
             "Liefert alle geloggten Workouts (inkl. Sätze: Übung, Satznummer, "
             "Wiederholungen, Gewicht) der letzten N Tage, unabhängig von der Quelle "
-            "(Strong-CSV-Import oder Chat-Logging). Enthält `hevy_workout_id` "
+            "(Hevy-Sync oder Chat-Logging). Enthält `hevy_workout_id` "
             "(nur bei source='hevy') — die für update_hevy_workout gebraucht wird."
         ),
         "input_schema": {
@@ -2114,13 +2102,3 @@ TOOL_FUNCTIONS: dict[str, Callable[..., dict[str, Any]]] = {
     "log_body_measurement": log_body_measurement,
     "update_body_measurement": update_body_measurement,
 }
-
-
-# ---------------------------------------------------------------------------
-# Dev-Task-Tools (Selbst-Erweiterung, nur für den Assistant — siehe agents.py)
-# ---------------------------------------------------------------------------
-
-from trainer.agent.dev_tasks import DEV_TOOL_FUNCTIONS, DEV_TOOL_SCHEMAS  # noqa: E402
-
-TOOL_SCHEMAS.extend(DEV_TOOL_SCHEMAS)
-TOOL_FUNCTIONS.update(DEV_TOOL_FUNCTIONS)

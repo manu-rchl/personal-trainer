@@ -2,11 +2,10 @@
 
 /* Hub — Vanilla JS, kein Framework, kein Build-Step.
  * Sidebar-App-Shell (Bento-Design, Light/Dark-Theme) mit Hash-Router und
- * 6 Views:
+ * 5 Views:
  *   #/               Overview (Ring-Hero + Quick-Stats + Stat-Tiles + Termine/Essen)
  *   #/chat/isa       Chat mit Isa
- *   #/chat/assistant Chat mit dem Assistant
- *   #/health         Health-Karten (Sparklines, Schlaf-Heatmap, Workouts/Woche)
+ *   #/health        Health-Karten (Sparklines, Schlaf-Heatmap, Workouts/Woche)
  *   #/training       Übungsliste, Fortschritt (Gewicht/e1RM), Volumen/Woche,
  *                    PR-Highlights, Session-Historie (such-/filterbar)
  *   #/ernaehrung     Makro-Donut (heute), Protein/Kalorien (14 Tage), Mahlzeiten
@@ -15,11 +14,9 @@
 
 const AGENT_META = {
   isa: { display: "Isa", subtitle: "Fitness & Ernährung" },
-  assistant: { display: "Assistant", subtitle: "Dein Chief of Staff" },
 };
 const EMPTY_CHAT_HINTS = {
   isa: "Noch keine Nachrichten — frag Isa nach deinem Schlaf.",
-  assistant: "Noch keine Nachrichten — frag deinen Assistenten, was heute ansteht.",
 };
 
 const REDUCE_MOTION = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -398,12 +395,6 @@ const ROUTES = {
     title: "Isa",
     subtitle: AGENT_META.isa.subtitle,
     render: (panel) => renderChat(panel, "isa"),
-  },
-  "#/chat/assistant": {
-    eyebrow: "Agent · Assistant",
-    title: "Assistant",
-    subtitle: AGENT_META.assistant.subtitle,
-    render: (panel) => renderChat(panel, "assistant"),
   },
   "#/health": {
     eyebrow: "01 · Fitness",
@@ -1096,9 +1087,8 @@ async function renderHealth(panel) {
  * --------------------------------------------------------------------- */
 
 const SOURCE_LABELS = {
+  hevy: "Hevy",
   chat: "Chat",
-  strong_csv: "Strong",
-  apple_health: "Apple Health",
 };
 
 function workoutRow(w) {
@@ -1555,7 +1545,7 @@ async function renderTraining(panel) {
     const empty = document.createElement("p");
     empty.className = "empty-state";
     empty.innerHTML = `Noch nichts geloggt.
-      <span class="empty-state-hint">Sag Isa im Chat, was du trainiert hast — oder importiere ein Strong-CSV.</span>`;
+      <span class="empty-state-hint">Sag Isa im Chat, was du trainiert hast — oder logge es in Hevy, der Sync holt es nachts.</span>`;
     panel.appendChild(empty);
     return;
   }
@@ -1587,7 +1577,7 @@ async function renderTraining(panel) {
     const empty = document.createElement("p");
     empty.className = "empty-state";
     empty.innerHTML = `Noch keine Session geloggt.
-      <span class="empty-state-hint">Sag Isa im Chat, was du trainiert hast — oder importiere ein Strong-CSV.</span>`;
+      <span class="empty-state-hint">Sag Isa im Chat, was du trainiert hast — oder logge es in Hevy, der Sync holt es nachts.</span>`;
     rightCol.appendChild(empty);
     return;
   }
