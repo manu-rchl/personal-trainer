@@ -3,15 +3,19 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.manuel.trainer.bot</string>
+    <string>com.manuel.trainer.hevy-full-sync</string>
 
+    <!-- Wöchentlicher Voll-Abgleich: holt ALLE Workouts und entfernt lokal,
+         was in Hevy gelöscht wurde (der tägliche Sync sieht nur die 20 neuesten). -->
     <key>ProgramArguments</key>
     <array>
         <string>/opt/homebrew/bin/uv</string>
         <string>run</string>
         <string>python</string>
         <string>-m</string>
-        <string>trainer.bot.main</string>
+        <string>trainer.ingest.hevy</string>
+        <string>sync</string>
+        <string>--full</string>
     </array>
 
     <key>WorkingDirectory</key>
@@ -25,26 +29,20 @@
         <string>/Users/manuelrocholl</string>
     </dict>
 
-    <key>RunAtLoad</key>
-    <true/>
-
-    <!-- Nur bei Crash (Exit != 0) neu starten; Konfigurationsfehler beenden
-         den Bot mit Exit 0 und bleiben liegen, bis jemand hinschaut. -->
-    <key>KeepAlive</key>
+    <key>StartCalendarInterval</key>
     <dict>
-        <key>SuccessfulExit</key>
-        <false/>
+        <key>Weekday</key>
+        <integer>0</integer>
+        <key>Hour</key>
+        <integer>22</integer>
+        <key>Minute</key>
+        <integer>30</integer>
     </dict>
 
-    <!-- Mindestabstand zwischen Neustarts: verhindert den Restart-Storm
-         (Default 10 s), der das System im August 2026 lahmgelegt hat. -->
-    <key>ThrottleInterval</key>
-    <integer>60</integer>
-
     <key>StandardOutPath</key>
-    <string>/Users/manuelrocholl/Library/Logs/trainer/bot.log</string>
+    <string>/Users/manuelrocholl/Library/Logs/trainer/hevy-full-sync.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/manuelrocholl/Library/Logs/trainer/bot.error.log</string>
+    <string>/Users/manuelrocholl/Library/Logs/trainer/hevy-full-sync.error.log</string>
 </dict>
 </plist>

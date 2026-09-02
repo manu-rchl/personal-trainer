@@ -130,6 +130,15 @@ def _persist_message(role: str, content: str, agent: str) -> None:
         conn.close()
 
 
+def persist_exchange(user_text: str, assistant_text: str, agent: str = "isa") -> None:
+    """Schreibt ein User/Assistant-Paar in die Historie — für Jobs (Report,
+    Reminder), die ohne echte User-Nachricht senden. Der synthetische
+    User-Turn hält die Historie strikt alternierend (API-Anforderung) und
+    macht im Verlauf sichtbar, dass die Nachricht vom System kam."""
+    _persist_message("user", user_text, agent)
+    _persist_message("assistant", assistant_text, agent)
+
+
 def _log_tool_call(
     agent: str, tool: str, tool_input: dict[str, Any], result: Any, ok: bool
 ) -> None:

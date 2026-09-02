@@ -17,18 +17,24 @@ Anthropic-API-Call auszulösen oder eine Telegram-Nachricht zu verschicken.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 from typing import Any
 
 import anthropic
 
+from trainer.agent.core import persist_exchange
 from trainer.config import config
 from trainer.db import get_connection, init_db
-from trainer.jobs.notify import send_telegram
+from trainer.jobs.notify import run_job, send_telegram
+
+logger = logging.getLogger(__name__)
 
 MAX_TOKENS = 1200
 PREV_WEEKS = 4
+LAST_REPORT_KEY = "last_weekly_report_week"
+SYNTHETIC_USER_TURN = "[System: Wochenreport So 18:00]"
 
 SYSTEM_PROMPT = """Du bist "Isa", Manuels persönlicher Fitness-Trainer & Health-Coach.
 
@@ -245,44 +251,58 @@ def generate_report_text(facts_block: str) -> str:
     return "\n".join(parts).strip()
 
 
-def _persist_message(text: str) -> None:
-    conn = get_connection()
-    try:
-        conn.execute(
-            "INSERT INTO messages (ts, role, content) VALUES (?, 'assistant', ?)",
-            (datetime.now(timezone.utc).isoformat(), text),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+def _week_key(monday: date) -> str:
+    iso_year, iso_week, _ = monday.isocalendar()
+    return f"{iso_year}-W{iso_week:02d}"
 
 
-def run(reference: date | None = None) -> None:
-    """Aggregiert, formuliert und verschickt den Wochenreport für die Woche um `reference`."""
+def run(reference: date | None = None, force: bool = False) -> None:
+    """Aggregiert, formuliert und verschickt den Wochenreport für die Woche um `reference`.
+
+    Dedupe über sync_state[LAST_REPORT_KEY] — der Report für dieselbe Woche
+    ging früher zweimal raus, wenn der Job doppelt getriggert wurde.
+    """
     today = reference or date.today()
     monday, sunday = week_bounds(today)
     prev_start, prev_end = previous_period_bounds(monday)
+    week_key = _week_key(monday)
 
     conn = get_connection()
     try:
+        row = conn.execute(
+            "SELECT value FROM sync_state WHERE key = ?", (LAST_REPORT_KEY,)
+        ).fetchone()
+        if row and row["value"] == week_key and not force:
+            logger.info("Wochenreport %s wurde schon gesendet — nichts zu tun.", week_key)
+            return
         current = aggregate_period(conn, monday, sunday)
         previous = aggregate_period(conn, prev_start, prev_end)
     finally:
         conn.close()
 
     if not has_oura_data(current):
-        send_telegram(NO_DATA_MESSAGE)
-        _persist_message(NO_DATA_MESSAGE)
-        print("Keine Oura-Daten für die aktuelle Woche — Hinweis-Nachricht gesendet.")
-        return
+        text = NO_DATA_MESSAGE
+        logger.warning("Keine Oura-Daten für %s — Hinweis-Nachricht statt Report.", week_key)
+    else:
+        facts_block = build_facts_block(current, previous, monday, sunday)
+        text = generate_report_text(facts_block)
 
-    facts_block = build_facts_block(current, previous, monday, sunday)
-    report_text = generate_report_text(facts_block)
-    send_telegram(report_text)
-    _persist_message(report_text)
-    print("Weekly Report gesendet und in messages gespeichert.")
+    send_telegram(text)
+    persist_exchange(SYNTHETIC_USER_TURN, text, agent="isa")
+
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO sync_state (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (LAST_REPORT_KEY, week_key),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    logger.info("Wochenreport %s gesendet und in messages gespeichert.", week_key)
 
 
 if __name__ == "__main__":
     init_db()
-    run()
+    run_job("weekly-report", run)

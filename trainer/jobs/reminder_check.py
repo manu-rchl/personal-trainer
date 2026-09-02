@@ -7,6 +7,8 @@ Rein deterministisch (Template-Text, KEIN Anthropic-API-Call) — der Job läuft
 täglich per launchd und soll nichts kosten.
 
 Logik:
+    0. Hevy-Sync anstoßen, damit das heutige Workout gezählt wird (der
+       nächtliche Sync um 23:00 kam bisher systematisch einen Tag zu spät).
     1. Schon heute eine Reminder-Nachricht verschickt? -> nichts tun (Dedupe
        über sync_state["last_reminder_date"]).
     2. Schon heute trainiert (echtes Workout mit date=heute)? -> nichts tun.
@@ -16,19 +18,29 @@ Logik:
     4. Nur senden, wenn es zum Wochenziel eng wird: verbleibende
        Trainingstage der Woche (heute eingeschlossen) <= noch offene
        Workouts. Sonst: noch entspannt, kein Reminder.
+
+Der gesendete Text wird in `messages` persistiert (mit synthetischem
+User-Turn), damit Isa im Chat weiß, dass sie erinnert hat.
 """
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from datetime import date, timedelta
 
+from trainer.agent.core import persist_exchange
+from trainer.config import config
 from trainer.db import get_connection, init_db
-from trainer.jobs.notify import send_telegram
+from trainer.ingest import hevy as hevy_ingest
+from trainer.jobs.notify import run_job, send_telegram
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_GYM_GOAL = 3
 GYM_GOAL_KEY = "gym_goal_per_week"
 LAST_REMINDER_KEY = "last_reminder_date"
+SYNTHETIC_USER_TURN = "[System: täglicher Reminder-Check 16:30]"
 
 # 3 Varianten in Isas Ton, Auswahl nach Wochentag-Index (deterministisch,
 # damit nicht jeden Tag dieselbe Formulierung kommt).
@@ -75,28 +87,55 @@ def parse_goal(raw: str | None) -> int:
         return DEFAULT_GYM_GOAL
 
 
+def should_remind(done: int, goal: int, today: date, trained_today: bool) -> bool:
+    """Reine Entscheidungslogik (testbar ohne DB/Telegram).
+
+    Erinnert nur, wenn heute nicht trainiert wurde, das Ziel offen ist und
+    die verbleibenden Tage der Woche (inkl. heute) nicht mehr ausreichen, um
+    noch einen Tag Puffer zu haben.
+    """
+    if trained_today:
+        return False
+    remaining_goal = goal - done
+    if remaining_goal <= 0:
+        return False
+    remaining_days = 7 - today.weekday()  # Montag -> 7, Sonntag -> 1
+    return remaining_days <= remaining_goal
+
+
 def build_reminder_text(done: int, goal: int, remaining: int, days: int, weekday: int) -> str:
     template = TEMPLATES[weekday % len(TEMPLATES)]
     return template.format(done=done, goal=goal, remaining=remaining, days=days)
+
+
+def _sync_hevy_best_effort() -> None:
+    if not config.hevy_api_key:
+        return
+    try:
+        result = hevy_ingest.sync(full=False)
+        logger.info("Hevy-Sync vor Reminder: %s", result)
+    except Exception:  # Sync-Fehler darf den Reminder nicht verhindern
+        logger.exception("Hevy-Sync vor Reminder fehlgeschlagen — zähle mit vorhandenen Daten")
 
 
 def run(today: date | None = None) -> None:
     today = today or date.today()
     today_iso = today.isoformat()
 
+    _sync_hevy_best_effort()
+
     conn = get_connection()
     try:
         if _get_sync_state(conn, LAST_REMINDER_KEY) == today_iso:
-            print("Heute bereits eine Reminder-Nachricht verschickt — nichts zu tun.")
+            logger.info("Heute bereits eine Reminder-Nachricht verschickt — nichts zu tun.")
             return
 
-        trained_today = conn.execute(
-            "SELECT COUNT(*) AS n FROM workouts WHERE date = ?", (today_iso,)
-        ).fetchone()["n"]
-        if trained_today > 0:
-            print("Heute schon trainiert — kein Reminder nötig.")
-            return
-
+        trained_today = (
+            conn.execute(
+                "SELECT COUNT(*) AS n FROM workouts WHERE date = ?", (today_iso,)
+            ).fetchone()["n"]
+            > 0
+        )
         goal = parse_goal(_get_profile_value(conn, GYM_GOAL_KEY))
 
         monday = today - timedelta(days=today.weekday())
@@ -105,39 +144,32 @@ def run(today: date | None = None) -> None:
             (monday.isoformat(), today_iso),
         ).fetchone()["n"]
 
-        remaining_goal = goal - workouts_done
-        if remaining_goal <= 0:
-            print(
-                f"Wochenziel bereits erreicht ({workouts_done}/{goal}) — "
-                "kein Reminder nötig."
-            )
-            return
-
-        # Resttage der Woche inkl. heute: Montag (weekday=0) -> 7, Sonntag (weekday=6) -> 1.
-        remaining_days = 7 - today.weekday()
-
-        if remaining_days > remaining_goal:
-            print(
-                f"Noch entspannt: {workouts_done}/{goal} Workouts, {remaining_days} "
-                f"Tag(e) für {remaining_goal} verbleibende Einheit(en) — kein "
-                "Reminder nötig."
+        if not should_remind(workouts_done, goal, today, trained_today):
+            logger.info(
+                "Kein Reminder nötig (heute trainiert=%s, %d/%d, Wochentag %d).",
+                trained_today,
+                workouts_done,
+                goal,
+                today.weekday(),
             )
             return
 
         text = build_reminder_text(
             done=workouts_done,
             goal=goal,
-            remaining=remaining_goal,
-            days=remaining_days,
+            remaining=goal - workouts_done,
+            days=7 - today.weekday(),
             weekday=today.weekday(),
         )
         send_telegram(text)
         _set_sync_state(conn, LAST_REMINDER_KEY, today_iso)
-        print(f"Reminder gesendet: {text}")
     finally:
         conn.close()
+
+    persist_exchange(SYNTHETIC_USER_TURN, text, agent="isa")
+    logger.info("Reminder gesendet: %s", text)
 
 
 if __name__ == "__main__":
     init_db()
-    run()
+    run_job("reminder-check", run)

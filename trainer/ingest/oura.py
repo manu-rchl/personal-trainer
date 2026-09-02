@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import secrets
 import sqlite3
 import sys
@@ -37,6 +38,9 @@ import httpx
 
 from trainer.config import config
 from trainer.db import get_connection, init_db
+from trainer.logging_setup import configure_logging
+
+logger = logging.getLogger(__name__)
 
 AUTHORIZE_URL = "https://cloud.ouraring.com/oauth/authorize"
 TOKEN_URL = "https://api.ouraring.com/oauth/token"
@@ -404,7 +408,7 @@ def sync(days: int = 7) -> None:
                         raise OuraAuthExpired(
                             f"Weiterhin 401 nach Token-Refresh. {REAUTH_HINT}"
                         )
-                    print("401 erhalten, versuche Token-Refresh...")
+                    logger.info("401 erhalten, versuche Token-Refresh...")
                     access_token = refresh_access_token(conn)
                     refreshed = True
                     client.headers["Authorization"] = f"Bearer {access_token}"
@@ -414,11 +418,11 @@ def sync(days: int = 7) -> None:
                     upsert_oura_daily(conn, kind, record)
                     total += 1
 
-                print(f"{kind}: {len(records)} Datensätze ({start_date} .. {end_date})")
+                logger.info("%s: %d Datensätze (%s .. %s)", kind, len(records), start_date, end_date)
 
         conn.commit()
         _set_state(conn, "oura_last_sync", str(time.time()))
-        print(f"Fertig. {total} Datensätze upserted.")
+        logger.info("Fertig. %d Datensätze upserted.", total)
     finally:
         conn.close()
 
@@ -443,9 +447,12 @@ def main() -> None:
     init_db()
 
     if args.command == "auth":
+        configure_logging()
         auth()
     elif args.command == "sync":
-        sync(days=args.days)
+        from trainer.jobs.notify import run_job  # lazy: jobs importieren ingest, nicht umgekehrt
+
+        run_job("oura-sync", lambda: sync(days=args.days))
 
 
 if __name__ == "__main__":

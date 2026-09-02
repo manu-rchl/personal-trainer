@@ -21,8 +21,8 @@ konservative Defaults, die von der API ggf. selbst gedeckelt werden.
 from __future__ import annotations
 
 import argparse
+import logging
 import sqlite3
-import sys
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -32,7 +32,13 @@ import httpx
 from trainer.config import config
 from trainer.db import get_connection, init_db
 
+logger = logging.getLogger(__name__)
+
 API_BASE = "https://api.hevyapp.com"
+
+# Ein Full-Sync, der weniger Workouts liefert, gilt als unplausibel (API-
+# Störung, falscher Account) — dann wird NICHTS gelöscht.
+FULL_SYNC_MIN_WORKOUTS_FOR_DELETE = 30
 
 WORKOUTS_PAGE_SIZE = 10
 TEMPLATES_PAGE_SIZE = 100
@@ -76,10 +82,12 @@ def _get_json(client: httpx.Client, path: str, params: dict[str, Any]) -> dict[s
             if attempt == MAX_RETRIES - 1:
                 break
             wait = RETRY_BACKOFF_SECONDS * (attempt + 1)
-            print(
-                f"429 (Rate-Limit) bei {path}, warte {wait:.0f}s "
-                f"(Versuch {attempt + 1}/{MAX_RETRIES})...",
-                file=sys.stderr,
+            logger.warning(
+                "429 (Rate-Limit) bei %s, warte %.0fs (Versuch %d/%d)",
+                path,
+                wait,
+                attempt + 1,
+                MAX_RETRIES,
             )
             time.sleep(wait)
             continue
@@ -109,12 +117,10 @@ def _extract_page_count(data: dict[str, Any]) -> int | None:
 
 def _require_api_key() -> None:
     if not config.hevy_api_key:
-        print(
-            "FEHLER: HEVY_API_KEY fehlt (siehe .env.example). Ohne Key ist "
-            "keine Hevy-Synchronisierung möglich.",
-            file=sys.stderr,
+        raise RuntimeError(
+            "HEVY_API_KEY fehlt (siehe .env.example). Ohne Key ist keine "
+            "Hevy-Synchronisierung möglich."
         )
-        sys.exit(1)
 
 
 # --------------------------------------------------------------------------
@@ -178,11 +184,31 @@ def upsert_hevy_workout(conn: sqlite3.Connection, workout: dict[str, Any]) -> st
     return status
 
 
+def delete_missing_hevy_workouts(conn: sqlite3.Connection, seen_ext_ids: set[str]) -> int:
+    """Löscht Hevy-Workouts (+ Sätze), die Hevy im Full-Sync nicht mehr geliefert hat.
+
+    Nur nach einem vollständigen Sync sinnvoll; Guard gegen leere/unplausible
+    Antworten liegt beim Aufrufer.
+    """
+    rows = conn.execute(
+        "SELECT id, ext_id FROM workouts WHERE source = 'hevy' AND ext_id IS NOT NULL"
+    ).fetchall()
+    stale_ids = [r["id"] for r in rows if r["ext_id"] not in seen_ext_ids]
+    if not stale_ids:
+        return 0
+    placeholders = ",".join("?" for _ in stale_ids)
+    conn.execute(f"DELETE FROM workout_sets WHERE workout_id IN ({placeholders})", stale_ids)
+    conn.execute(f"DELETE FROM workouts WHERE id IN ({placeholders})", stale_ids)
+    conn.commit()
+    return len(stale_ids)
+
+
 def sync(full: bool = False) -> dict[str, Any]:
     """Synchronisiert Hevy-Workouts in die DB.
 
     full=False: nur die ersten `DEFAULT_SYNC_PAGES` Seiten (neueste Workouts,
-    für den Alltags-Sync). full=True: alle Seiten (Backfill/Migration).
+    für den Alltags-Sync). full=True: alle Seiten (Backfill) — und danach
+    Abgleich: in Hevy gelöschte Workouts fliegen auch hier raus.
     """
     _require_api_key()
     conn = get_connection()
@@ -190,7 +216,9 @@ def sync(full: bool = False) -> dict[str, Any]:
         inserted = 0
         updated = 0
         skipped = 0
+        deleted = 0
         page = 1
+        seen_ext_ids: set[str] = set()
 
         with httpx.Client(base_url=API_BASE, headers=_headers(), timeout=30) as client:
             while True:
@@ -202,6 +230,8 @@ def sync(full: bool = False) -> dict[str, Any]:
                     break
 
                 for w in workouts:
+                    if w.get("id"):
+                        seen_ext_ids.add(str(w["id"]))
                     status = upsert_hevy_workout(conn, w)
                     if status == "inserted":
                         inserted += 1
@@ -220,12 +250,23 @@ def sync(full: bool = False) -> dict[str, Any]:
                     break
                 page += 1
 
+        if full:
+            if len(seen_ext_ids) >= FULL_SYNC_MIN_WORKOUTS_FOR_DELETE:
+                deleted = delete_missing_hevy_workouts(conn, seen_ext_ids)
+            else:
+                logger.warning(
+                    "Full-Sync lieferte nur %d Workouts (< %d) — Delete-Abgleich übersprungen.",
+                    len(seen_ext_ids),
+                    FULL_SYNC_MIN_WORKOUTS_FOR_DELETE,
+                )
+
         _set_state(conn, "hevy_last_sync", str(time.time()))
         conn.commit()
         return {
             "inserted": inserted,
             "updated": updated,
             "skipped": skipped,
+            "deleted": deleted,
             "pages_fetched": page,
         }
     finally:
@@ -308,15 +349,23 @@ def main() -> None:
     args = parser.parse_args()
     init_db()
 
-    if args.command == "sync":
-        result = sync(full=args.full)
-        print(
-            f"Fertig. Neu: {result['inserted']}, aktualisiert: {result['updated']}, "
-            f"übersprungen: {result['skipped']}."
-        )
-    elif args.command == "templates":
-        count = cache_templates()
-        print(f"Fertig. {count} Exercise-Templates gecached.")
+    def _run() -> None:
+        if args.command == "sync":
+            result = sync(full=args.full)
+            logger.info(
+                "Fertig. Neu: %d, aktualisiert: %d, übersprungen: %d, gelöscht: %d.",
+                result["inserted"],
+                result["updated"],
+                result["skipped"],
+                result["deleted"],
+            )
+        elif args.command == "templates":
+            count = cache_templates()
+            logger.info("Fertig. %d Exercise-Templates gecached.", count)
+
+    from trainer.jobs.notify import run_job  # lazy: jobs importieren ingest, nicht umgekehrt
+
+    run_job("hevy-full-sync" if getattr(args, "full", False) else f"hevy-{args.command}", _run)
 
 
 if __name__ == "__main__":
