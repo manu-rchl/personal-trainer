@@ -1,5 +1,17 @@
 # Personal Trainer Agent — Umsetzungsplan
 
+> **Stand 2026-09-02:** Phasen 0–4 dieses Plans sind umgesetzt, danach hat ein
+> Audit einiges wieder entfernt: Apple-Health-Webhook (nie genutzt), Strong-CSV
+> (durch Hevy ersetzt), ein zweiter „Assistant"-Agent und eine
+> Dev-Task-Selbsterweiterung (Sicherheitsrisiko, nie genutzt). Aktueller
+> Betriebsstand: `README.md`. Nächste Phasen (nicht in diesem Dokument):
+> **Phase 1 Coach-Kern** — `trainer/analytics.py` mit `effective_load`/e1RM,
+> Tabellen `training_plan`/`exercise_targets`, Tools `get_exercise_progress`
+> + `get_hevy_routines`, Post-Workout-Reflexions-Job, Report/Reminder über den
+> Agenten statt Template. **Phase 2 Lernen** — Memory-Konsolidierung
+> (`update/delete_memory`, pinned/source/valid_from), Wissens-Loop über
+> NotebookLM bei Plateau, Historien-Zusammenfassung beim Fenstersprung.
+
 ## Kontext
 
 Persönlicher AI-Fitness-Trainer für einen einzelnen Nutzer (Manuel). Der Agent:

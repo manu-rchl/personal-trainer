@@ -1,233 +1,135 @@
-# Personal Trainer — Fundament + Telegram-Bot (Phase 0-2)
+# Personal Trainer — Isa
 
-Persönlicher AI-Fitness-Trainer, Single-User, SQLite. Dieses Repo enthält das
-Fundament (Config, DB-Schema), die Daten-Ingestion (Oura, Apple Health, Strong)
-sowie den Telegram-Bot mit Trainer-Agent "Isa" (Phase 2). Scheduling (Weekly-
-Report, Reminder) und Google Calendar folgen in Phase 3/4 (siehe `PLAN.md`).
+Persönlicher AI-Fitness-Coach für einen Nutzer (Manuel). Ein Telegram-Bot
+("Isa") mit Tool-Use-Agent, SQLite als einzige Datenbank, tägliche Daten-Syncs
+(Oura Ring, Hevy) und ein lokales Web-Dashboard. Läuft auf dem Mac per launchd.
+
+Stand 2026-09 (Phase 0 abgeschlossen): ein Agent, keine Selbst-Erweiterung,
+kein Apple-Health-Webhook, kein Strong-CSV — siehe `PLAN.md` für die
+Historie und die nächsten Phasen (Coach-Kern, Lernen).
 
 ## Setup
 
 ```bash
 uv sync
-cp .env.example .env   # falls noch nicht geschehen, dann echte Werte eintragen
+cp .env.example .env   # echte Werte eintragen
+uv run python -m trainer.db   # Schema + Migrationen (idempotent)
 ```
 
-Benötigte Variablen in `.env` (siehe `.env.example`):
+Variablen in `.env` (siehe `.env.example`):
 
-- `ANTHROPIC_API_KEY` — für den Trainer-Agenten (Isa)
-- `TRAINER_MODEL` — Anthropic-Modell für den Agenten, default `claude-sonnet-5`
-  (optional, weglassen = Default wird verwendet)
-- `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_CHAT_ID` — Bot-Token von @BotFather +
-  die einzige Chat-ID, die der Bot bedient (alle anderen werden höflich abgewiesen)
-- `OURA_CLIENT_ID`, `OURA_CLIENT_SECRET` — für den Oura-OAuth2-Flow
-- `HEALTH_WEBHOOK_SECRET` — Bearer-Token, das der Health-Auto-Export-Webhook erwartet
+| Variable | Zweck |
+|---|---|
+| `ANTHROPIC_API_KEY`, `TRAINER_MODEL` | Agent (Default-Modell `claude-sonnet-5`) |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_CHAT_ID` | Bot-Token von @BotFather + die einzige bediente Chat-ID |
+| `OURA_CLIENT_ID`, `OURA_CLIENT_SECRET` | Oura-OAuth2 (Tokens landen in der Tabelle `secrets`) |
+| `HEVY_API_KEY` | Hevy Pro API-Key |
+| `CALENDAR_ICS_URLS` | kommaseparierte geheime iCal-Links (read-only) |
+| `OBSIDIAN_VAULT_PATH` | Vault, den Isa lesen und pflegen darf |
+| `WEB_AUTH_TOKEN` | Bearer-Token fürs Dashboard (`openssl rand -hex 24`) |
 
-Die DB-Datei liegt standardmäßig unter `data/trainer.db` (wird automatisch angelegt).
+Die DB liegt unter `data/trainer.db`. Schema-Änderungen laufen über die
+versionierte `MIGRATIONS`-Liste in `trainer/db.py` (`PRAGMA user_version`);
+`init_db()` wird nur an Prozess-Einstiegen aufgerufen.
 
-## Datenbank initialisieren
+## Datenquellen
+
+**Oura** (Schlaf/Readiness/Aktivität/HRV):
 
 ```bash
-uv run python -c "from trainer.db import init_db; init_db()"
+uv run python -m trainer.ingest.oura auth          # einmalig, Browser-Flow
+uv run python -m trainer.ingest.oura sync --days 7  # täglich per launchd
 ```
 
-Legt alle Tabellen an (idempotent): `oura_daily`, `health_metrics`, `workouts`,
-`workout_sets`, `profile`, `messages`, `sync_state`.
+Refresh-Tokens sind single-use und werden atomar persistiert. Ist der
+Refresh-Token tot, kommt eine Telegram-Nachricht mit dem `auth`-Hinweis.
 
-## Ingest-Befehle
-
-### 1. Oura (OAuth2, Schlaf/Readiness/Aktivität)
+**Hevy** (Workouts):
 
 ```bash
-# Einmalig: Browser-Autorisierung, Tokens werden in sync_state gespeichert
-uv run python -m trainer.ingest.oura auth
-
-# Tägliche Synchronisierung (default: letzte 7 Tage)
-uv run python -m trainer.ingest.oura sync
-
-# Backfill z.B. letzte 90 Tage
-uv run python -m trainer.ingest.oura sync --days 90
+uv run python -m trainer.ingest.hevy sync          # 20 neueste Workouts (täglich)
+uv run python -m trainer.ingest.hevy sync --full   # alle + Abgleich gelöschter (wöchentlich)
+uv run python -m trainer.ingest.hevy templates     # Übungskatalog cachen
 ```
 
-`auth` startet kurzzeitig einen lokalen HTTP-Server auf `http://localhost:8484/oura/callback`,
-öffnet den Browser zur Oura-Autorisierungsseite und tauscht den Code gegen
-Access-/Refresh-Token. Oura-Refresh-Tokens sind **single-use** — bei jedem
-Refresh (auch während `sync`) wird sofort ein neuer Refresh-Token gespeichert.
+**Gewichts-Konvention:** `workout_sets.weight_kg` ist bei Langhantel das
+Scheibengewicht EINER Seite (reale Last = 20 kg + 2×Wert), bei Kurzhanteln
+das Gewicht pro Hantel. Isa kennt das aus dem Prompt; das Dashboard rechnet
+bis Phase 1 noch mit den Rohwerten.
 
-### 2. Apple Health Webhook (Health Auto Export)
-
-Server starten:
+## Isa (Telegram-Bot)
 
 ```bash
-uv run uvicorn trainer.ingest.webhook:app --host 0.0.0.0 --port 8080
+uv run python -m trainer.bot.main
 ```
 
-Endpoints:
-- `GET /health` → `{"status": "ok"}`
-- `POST /health-export` → nimmt Health-Auto-Export-JSON entgegen, erwartet Header
-  `Authorization: Bearer <HEALTH_WEBHOOK_SECRET>`. Antwort: `{"imported": N, "skipped": M}`.
+- Nur `TELEGRAM_ALLOWED_CHAT_ID` wird bedient.
+- Text, Foto (Essens-Analyse → `meals`) und Sprachnachrichten (faster-whisper
+  lokal) gehen an den Agenten (`trainer/agent/core.py`).
+- Prompt (`trainer/agents.py`): Rolle/Ton, **fester Athleten-Steckbrief**,
+  Gewichts-Konvention, Ehrlichkeitsregel („gespeichert" nur mit Tool-Result),
+  Tool-Hinweise. Dynamisch dazu: Datum, `profile`, `memories`.
+- Jeder Tool-Aufruf landet in `tool_log` (Input, gekapptes Ergebnis, ok-Flag).
+- Antworten werden als Telegram-HTML gesendet; Turn-Timeout 240 s mit
+  Typing-Indikator; alle 5 min ein Heartbeat in `sync_state`.
+- Ein Datei-Lock pro Agent verhindert, dass Bot und Web-Chat gleichzeitig
+  auf derselben Historie arbeiten.
+- `query_db` ist read-only und kann `secrets`/`sync_state` nicht lesen
+  (SQLite-Authorizer, auch in Subqueries).
 
-**Health Auto Export App konfigurieren** (iPhone):
-- REST-API-Automation anlegen, URL: `http://<mac-ip>:8080/health-export`
-  (im gleichen WLAN, oder via Tailscale für unterwegs)
-- Header: `Authorization: Bearer <dein HEALTH_WEBHOOK_SECRET>`
-- Format: JSON, Struktur wie folgt:
-
-  ```json
-  {
-    "data": {
-      "metrics": [
-        {
-          "name": "heart_rate",
-          "units": "bpm",
-          "data": [{"date": "2026-07-01 08:00:00 +0200", "qty": 62.0}]
-        }
-      ],
-      "workouts": [
-        {"name": "Functional Strength Training", "start": "2026-07-01 18:00:00 +0200", "end": "..."}
-      ]
-    }
-  }
-  ```
-
-- Sync-Intervall nach Bedarf (z.B. alle paar Stunden); Syncs feuern nur bei
-  entsperrtem iPhone — Upserts sind idempotent, unregelmäßige Pushes sind ok.
-
-### 3. Strong CSV-Import
+## Web-Dashboard
 
 ```bash
-uv run python -m trainer.ingest.strong_csv pfad/zur/export.csv
+uv run uvicorn trainer.web.app:app --host 127.0.0.1 --port 8090
 ```
 
-Export in der Strong-App: Settings → Export Strong Data. Import ist deduped
-(SHA256 pro Zeile in `sync_state`) — mehrfacher Import derselben Datei ist safe.
+Alle `/api/*`-Routen verlangen `Authorization: Bearer <WEB_AUTH_TOKEN>`; der
+Browser fragt den Token einmal ab und merkt ihn sich (localStorage). Host
+muss `127.0.0.1`/`localhost` sein. Vor einem Umzug auf einen VPS: nur hinter
+Tailscale/WireGuard betreiben.
 
-## Telegram-Bot + Multi-Agent-System (Isa, Assistant)
+## Jobs
 
-Der Bot nutzt das offizielle `anthropic`-Python-SDK mit einem selbstgebauten
-Tool-Use-Loop (bewusst kein `claude-agent-sdk`, wegen späterer Portabilität
-auf einen VPS). Es gibt zwei Agenten mit je eigenem Telegram-Bot, eigenem
-System-Prompt und eigenem Tool-Subset, definiert in der Registry
-`trainer/agents.py`:
-
-- **Isa** (`isa`) — Trainer & Health-Coach. Tools: `get_health_summary`,
-  `get_workouts`, `log_workout`, `get_meals`, `log_meal`, `query_db`
-  (read-only SELECT), `get_profile`, `update_profile`, `save_memory`,
-  `search_memories`, `get_calendar`, `search_notes`, `read_note`.
-- **Assistant** (`assistant`) — Manuels persönlicher Assistent/Chief of
-  Staff, Generalist für alles außer Training/Ernährung (dafür verweist er an
-  Isa). Dieselben Tools wie Isa, aber **ohne** `log_workout`/`log_meal`.
-
-Beide Agenten haben eine **getrennte Chat-Historie** (Tabelle `messages`,
-Spalte `agent`), teilen sich aber das Langzeit-Gedächtnis (`memories`) — was
-Isa über Manuel lernt, kennt der Assistent auch und umgekehrt.
-
-Bot starten (Long Polling, blockiert das Terminal), Agent per `--agent`-Flag
-wählen (default `isa`):
-
-```bash
-uv run python -m trainer.bot.main                    # Isa (default)
-uv run python -m trainer.bot.main --agent assistant   # Assistant
-```
-
-Für den Assistant-Bot muss `ASSISTANT_BOT_TOKEN` in `.env` gesetzt sein
-(eigener Bot bei @BotFather anlegen) — ohne Token bricht der Start mit einer
-klaren Fehlermeldung ab, statt mit einem Traceback zu crashen.
-
-Funktionen:
-- Nur die in `TELEGRAM_ALLOWED_CHAT_ID` konfigurierte Chat-ID wird bedient,
-  alle anderen Chats bekommen eine höfliche Ablehnung.
-- `/start` — kurze, agentenspezifische Vorstellung.
-- Textnachrichten — gehen an den jeweiligen Tool-Use-Agenten. Antworten
-  werden bei 4096 Zeichen automatisch gesplittet.
-- `.csv`-Datei-Upload — wird als Strong-Export importiert (nutzt denselben
-  Importer wie `trainer.ingest.strong_csv`), Ergebnis-Zusammenfassung kommt
-  als Nachricht zurück. **Nur beim Isa-Bot registriert.**
-
-`TRAINER_MODEL` (env var, default `claude-sonnet-5`) steuert, welches
-Anthropic-Modell beide Agenten verwenden.
-
-## Automatisierung (Phase 3: geplante Jobs + Autostart)
-
-### Jobs
-
-- **`trainer.jobs.weekly_report`** (`uv run python -m trainer.jobs.weekly_report`,
-  So. 18:00): aggregiert deterministisch per SQL die aktuelle Woche (Mo-So,
-  lokale Zeit) gegen den Durchschnitt der 4 Vorwochen (Sleep/Readiness-Score,
-  HRV + Ruhepuls + Schlafdauer aus `kind='sleep_detail'`, Ø Schritte/Tag,
-  Workouts + Sätze, Mahlzeiten + Ø Protein/Tag). Genau EIN Anthropic-API-Call
-  (kein Tool-Use) formuliert daraus Isas Wochenreport (Überblick, Auffälligkeiten
-  vs. Vorwochen, 1-2 Änderungsempfehlungen). Wird per Telegram verschickt und
-  zusätzlich in `messages` (role='assistant') gespeichert, damit Isa im Chat
-  darauf Bezug nehmen kann. Sind für die aktuelle Woche keine Oura-Daten
-  vorhanden, geht statt eines leeren Reports nur ein kurzer Hinweis raus.
-  Aggregation (`aggregate_period`/`build_facts_block`) und
-  Formulierung/Versand (`generate_report_text`/`run`) sind getrennte
-  Funktionen — die Zahlen lassen sich isoliert testen, ohne API-Kosten oder
-  eine Telegram-Nachricht auszulösen.
-
-- **`trainer.jobs.reminder_check`** (`uv run python -m trainer.jobs.reminder_check`,
-  täglich 16:30): vergleicht das Wochenziel (`profile["gym_goal_per_week"]`,
-  Default 3) mit den echten Trainingstagen dieser Woche (Mo..heute, `COUNT
-  DISTINCT date` aus `workouts`). Ist heute schon trainiert worden oder das
-  Ziel bereits erreicht, passiert nichts. Sonst wird nur erinnert, wenn es
-  eng wird: verbleibende Trainingstage der Woche (heute eingeschlossen) <=
-  noch offene Workouts. Rein deterministisch (Template-Text, 2-3 Varianten
-  nach Wochentag gewählt) — **kein** Anthropic-API-Call, da der Job täglich
-  läuft. Dedupe über `sync_state["last_reminder_date"]`: höchstens eine
-  Reminder-Nachricht pro Tag.
-
-- **`trainer.jobs.notify`** — gemeinsamer Telegram-Versand (`send_telegram`)
-  für beide Jobs, plain `httpx`-POST an die Bot-API (kein
-  `python-telegram-bot`, da hier kein Application/Polling-Kontext existiert),
-  splittet bei 4096 Zeichen.
-
-### launchd-Autostart (macOS)
-
-Unter `deploy/` liegen 5 launchd-Agents (Label-Prefix `com.manuel.trainer.*`):
-
-| Label | Trigger | Kommando |
+| Job | Wann | Was |
 |---|---|---|
-| `com.manuel.trainer.bot` | `RunAtLoad` + `KeepAlive` (läuft dauerhaft) | `trainer.bot.main` (Isa) |
-| `com.manuel.trainer.assistant` | `RunAtLoad` + `KeepAlive` (läuft dauerhaft) | `trainer.bot.main --agent assistant` |
-| `com.manuel.trainer.oura-sync` | täglich 10:30 | `trainer.ingest.oura sync --days 7` |
-| `com.manuel.trainer.weekly-report` | So. 18:00 | `trainer.jobs.weekly_report` |
-| `com.manuel.trainer.reminder` | täglich 16:30 | `trainer.jobs.reminder_check` |
+| `trainer.ingest.oura sync --days 7` | täglich 10:30 | Oura-Daten |
+| `trainer.ingest.hevy sync` | täglich 23:00 | neueste Hevy-Workouts |
+| `trainer.ingest.hevy sync --full` | So 22:30 | alle Workouts + Delete-Abgleich |
+| `trainer.jobs.reminder_check` | täglich 16:30 | Gym-Reminder, wenn's zum Wochenziel eng wird (synct vorher Hevy) |
+| `trainer.jobs.weekly_report` | So 18:00 | Wochenreport (ein API-Call), Dedupe pro ISO-Woche |
+| `trainer.jobs.health_check` | täglich 09:00 | Sync-Alter, Token-Ablauf, Bot-Heartbeat, Trainingslücke |
 
-> `com.manuel.trainer.assistant.plist` ist noch nicht geladen (kein
-> `ASSISTANT_BOT_TOKEN` in `.env` hinterlegt) — sobald der Token gesetzt ist,
-> installiert `install-launchd.sh` ihn wie die anderen Agents.
+Jeder Job läuft in `trainer.jobs.notify.run_job`: bei einer Exception geht
+eine ⚠️-Telegram-Nachricht raus und der Job endet mit Exit 1. Reminder und
+Report werden in `messages` persistiert (mit `[System: …]`-User-Turn), damit
+Isa im Chat weiß, was sie geschickt hat.
 
-Alle Agents nutzen den absoluten Pfad zu `uv` (launchd hat kein
-Shell-/PATH-Profil), `WorkingDirectory` = Repo-Root, `EnvironmentVariables`
-mit `PATH`/`HOME`, und schreiben Logs nach
-`~/Library/Logs/trainer/<job>.log` bzw. `.error.log`.
-
-**Installieren** (Ordner `deploy/`):
+## Betrieb (launchd, macOS)
 
 ```bash
-bash deploy/install-launchd.sh
-```
-
-Legt den Log-Ordner an, kopiert die plists nach `~/Library/LaunchAgents/`,
-lädt sie (`launchctl unload` + `load`, Fehler beim erstmaligen `unload`
-werden ignoriert) und zeigt den Status.
-
-> Läuft der Bot bereits manuell in einem Terminal (`uv run python -m
-> trainer.bot.main`), diesen VORHER stoppen — sonst pollen zwei Instanzen
-> gleichzeitig gegen die Telegram-API.
-
-**Deinstallieren:**
-
-```bash
+bash deploy/install-launchd.sh     # kopiert, enabled, bootstrapped alle Agents
 bash deploy/uninstall-launchd.sh
+launchctl list | grep com.manuel.trainer
+tail -f ~/Library/Logs/trainer/bot.error.log   # Python-Logs gehen auf stderr
 ```
 
-Entlädt alle 4 Agents und entfernt die plists aus `~/Library/LaunchAgents/`
-(Logs bleiben erhalten).
+Bot und Web haben `KeepAlive` nur bei Crash (`SuccessfulExit=false`) und
+`ThrottleInterval 60` — ein Konfigurationsfehler beendet den Bot mit Exit 0
+und löst keinen Restart-Storm mehr aus (das hat das System im August 2026
+lahmgelegt). Das Install-Skript nutzt `launchctl enable`, weil ein
+persistenter `disabled`-Override von `launchctl load` nicht aufgehoben wird.
 
-## Status
+**Wenn eine ⚠️-Nachricht kommt:** Log des Jobs unter
+`~/Library/Logs/trainer/<job>.error.log` lesen; bei „Oura-Login abgelaufen"
+`uv run python -m trainer.ingest.oura auth` ausführen; bei fehlendem
+Bot-Heartbeat `launchctl kickstart -k gui/$UID/com.manuel.trainer.bot`.
 
-Phase 0 (Fundament), Phase 1 (Daten-Ingestion), Phase 2 (Telegram-Bot +
-Trainer-Agent) und Phase 3 (geplante Jobs + launchd-Autostart) sind
-umgesetzt. Google Calendar (Phase 4) ist **out of scope** für diesen Stand —
-siehe `PLAN.md` für die weiteren Phasen.
+## Tests
+
+```bash
+uv run pytest -q
+```
+
+Abgedeckt: Prompt↔Tool-Konsistenz, `query_db`-Authorizer, DB-Migrationen
+(frisch/legacy/idempotent), Telegram-HTML + Chunking, Reminder-Logik,
+Health-Check-Bewertung, Hevy-Routine-Payloads, Obsidian-Schreibpfade.
