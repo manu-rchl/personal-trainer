@@ -1,0 +1,9 @@
+[Unit]
+Description=Trainer Memory-Review (Vorschlag an Manuel)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/manuel/personal-trainer-manuel
+ExecStart=/root/.local/bin/uv run python -m trainer.jobs.memory_review
+StandardOutput=append:/root/manuel/personal-trainer-manuel/logs/memory-review.log
+StandardError=append:/root/manuel/personal-trainer-manuel/logs/memory-review.error.log

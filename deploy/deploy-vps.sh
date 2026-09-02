@@ -68,7 +68,7 @@ fi
 
 cp deploy/systemd/trainer-*.service deploy/systemd/trainer-*.timer /etc/systemd/system/
 systemctl daemon-reload
-for t in oura-sync hevy-sync hevy-full-sync reminder weekly-report health-check post-workout morning-checkin; do
+for t in oura-sync hevy-sync hevy-full-sync reminder weekly-report health-check post-workout morning-checkin memory-review; do
     systemctl enable --now "trainer-\$t.timer" >/dev/null
 done
 systemctl enable --now trainer-bot trainer-web >/dev/null

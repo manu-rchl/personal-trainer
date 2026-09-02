@@ -1,0 +1,9 @@
+[Unit]
+Description=Trainer Memory-Review (Sun *-*-* 18:30:00)
+
+[Timer]
+OnCalendar=Sun *-*-* 18:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
