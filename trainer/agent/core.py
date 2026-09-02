@@ -14,15 +14,19 @@ Agent-Definitionen (System-Prompt, Tool-Subset, Bot-Token) leben in
 from __future__ import annotations
 
 import base64
+import fcntl
 import json
 import logging
+import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Iterator
 
 import anthropic
 
 from trainer.agent.tools import TOOL_FUNCTIONS, TOOL_SCHEMAS, get_profile
 from trainer.agents import (
+    ATHLETE_PROFILE,
     DB_SCHEMA_OVERVIEW,
     DYNAMIC_CONTEXT_TEMPLATE,
     AgentDef,
@@ -37,6 +41,25 @@ MEMORY_INLINE_LIMIT = 100
 MEMORY_INLINE_RECENT = 50
 
 MAX_TOOL_ITERATIONS = 8
+# Tool-Results werden VOR dem Rücksenden ans Modell gekappt: get_workouts(days=365)
+# oder eine große Notiz können sonst allein den Kontext sprengen — und bei bis
+# zu 8 Iterationen addieren sich die Results.
+MAX_TOOL_RESULT_CHARS = 12_000
+# Im tool_log reicht ein Ausschnitt — es geht um "wurde es aufgerufen, kam ein
+# Fehler", nicht um eine zweite Kopie der Daten.
+TOOL_LOG_RESULT_CHARS = 4_000
+# Bot (Telegram) und Web-Chat laufen als getrennte Prozesse auf derselben
+# Historie — ohne Lock laden beide dieselbe Historie ohne die jeweils andere
+# User-Nachricht und persistieren dann user,user,assistant,assistant.
+AGENT_LOCK_TIMEOUT_S = 300
+
+# Text, den run_agent liefert, wenn der Turn nicht sauber zu Ende kam. Wird
+# bewusst NICHT persistiert — sonst steht "ich breche ab" dauerhaft als echte
+# Isa-Antwort in der Historie.
+ABORT_TEXT = (
+    "Ich brauche dafür zu viele Schritte und breche ab – frag mich gern "
+    "nochmal konkreter."
+)
 # War 1500 — zu knapp für Isas ausführlichere Antworten (Trainingspläne,
 # Erklärungen): das Modell stoppte mitten im Satz (stop_reason="max_tokens"),
 # und der abgeschnittene Text wurde unmarkiert als fertige Antwort behandelt.
@@ -107,6 +130,69 @@ def _persist_message(role: str, content: str, agent: str) -> None:
         conn.close()
 
 
+def _log_tool_call(
+    agent: str, tool: str, tool_input: dict[str, Any], result: Any, ok: bool
+) -> None:
+    """Schreibt einen Tool-Aufruf ins tool_log — Fehler hier dürfen den Turn nie killen."""
+    try:
+        conn = get_connection()
+        try:
+            conn.execute(
+                "INSERT INTO tool_log (ts, agent, tool, input_json, result_json, ok) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    agent,
+                    tool,
+                    json.dumps(tool_input, ensure_ascii=False, default=str),
+                    json.dumps(result, ensure_ascii=False, default=str)[:TOOL_LOG_RESULT_CHARS],
+                    1 if ok else 0,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:  # Logging ist Beiwerk — niemals den Agent-Turn abbrechen
+        logger.exception("tool_log-Insert fehlgeschlagen (%s)", tool)
+
+
+def _serialize_tool_result(result: Any) -> str:
+    text = json.dumps(result, ensure_ascii=False, default=str)
+    if len(text) <= MAX_TOOL_RESULT_CHARS:
+        return text
+    return (
+        text[:MAX_TOOL_RESULT_CHARS]
+        + f'\n… [gekürzt: Ergebnis hatte {len(text)} Zeichen, Limit {MAX_TOOL_RESULT_CHARS}. '
+        "Frag mit engerem Zeitraum/Filter nochmal, falls du den Rest brauchst.]"
+    )
+
+
+@contextmanager
+def _agent_lock(agent: str) -> Iterator[None]:
+    """Prozessübergreifender Lock pro Agent (fcntl.flock auf data/.lock-<agent>)."""
+    lock_path = config.db_path.parent / f".lock-{agent}"
+    fd = open(lock_path, "w")
+    deadline = time.monotonic() + AGENT_LOCK_TIMEOUT_S
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    raise TimeoutError(
+                        f"Agent '{agent}' ist seit {AGENT_LOCK_TIMEOUT_S}s in einem anderen "
+                        "Prozess beschäftigt."
+                    )
+                time.sleep(0.5)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            fd.close()
+
+
 def _load_memories_for_prompt() -> list[dict[str, Any]]:
     conn = get_connection()
     try:
@@ -149,7 +235,9 @@ def _build_system_blocks(agent_def: AgentDef) -> list[dict[str, Any]]:
     Memories) steht in Block 2 NACH dem Breakpoint, damit es den Cache des
     stabilen Teils nicht invalidiert.
     """
-    static_text = agent_def.system_prompt_template.format(schema=DB_SCHEMA_OVERVIEW)
+    static_text = agent_def.system_prompt_template.format(
+        athlete=ATHLETE_PROFILE, schema=DB_SCHEMA_OVERVIEW
+    )
 
     profile = get_profile()["profile"]
     profile_text = (
@@ -191,13 +279,32 @@ def run_agent(
 ) -> str:
     """Führt eine Runde des angegebenen Agenten aus und liefert die finale Antwort.
 
+    Hält währenddessen den prozessübergreifenden Agent-Lock (Bot und Web-Chat
+    dürfen nicht gleichzeitig auf derselben Historie arbeiten). Bei Lock-Timeout
+    kommt eine freundliche Meldung statt einer Exception.
+    """
+    try:
+        with _agent_lock(agent):
+            return _run_agent_unlocked(user_message, image, agent)
+    except TimeoutError as exc:
+        logger.warning("Agent-Lock-Timeout [%s]: %s", agent, exc)
+        return (
+            "Ich bin gerade noch mit einer anderen Nachricht von dir beschäftigt – "
+            "gib mir einen Moment und schick's dann nochmal."
+        )
+
+
+def _run_agent_unlocked(
+    user_message: str, image: tuple[str, bytes] | None, agent: str
+) -> str:
+    """Eigentlicher Agent-Turn (ohne Lock — nur über run_agent aufrufen).
+
     `agent` wählt die AgentDef (System-Prompt + Tool-Subset) aus der Registry
-    in `trainer.agents` (default "isa"). Lädt Kontext NUR aus der Historie
-    dieses Agenten aus der DB, ruft die Anthropic-API mit dessen Tool-Subset
-    auf, führt angeforderte Tools lokal aus (max. MAX_TOOL_ITERATIONS Runden)
-    und persistiert sowohl die Nutzer-Nachricht als auch die finale Antwort
-    mit Agent-Zuordnung. Das Langzeit-Gedächtnis (memories) bleibt zwischen
-    allen Agenten geteilt (siehe `_build_memories_text`).
+    in `trainer.agents`. Lädt Kontext NUR aus der Historie dieses Agenten aus
+    der DB, ruft die Anthropic-API mit dessen Tool-Subset auf, führt
+    angeforderte Tools lokal aus (max. MAX_TOOL_ITERATIONS Runden, jeder Call
+    landet im tool_log) und persistiert sowohl die Nutzer-Nachricht als auch
+    die finale Antwort mit Agent-Zuordnung.
 
     `image`, falls gesetzt, ist ein (media_type, raw_bytes)-Tupel (z.B. ein
     Essens-Foto). Das Bild wird nur für den aktuellen API-Call verwendet — in
@@ -212,13 +319,9 @@ def run_agent(
         name: fn for name, fn in TOOL_FUNCTIONS.items() if name in agent_def.tool_names
     }
 
-    # max_retries erhöht (SDK-Default: 2): Der Account läuft aktuell auf dem
-    # Anthropic Free Tier (5 RPM/10K ITPM) — ein Tool-Loop mit mehreren
-    # Iterationen kann das knapp bemessene RPM-Budget allein ausschöpfen.
-    # Das SDK retried 429s automatisch mit Backoff und respektiert den
-    # retry-after-Header; mehr Retries geben einzelnen Turns eine bessere
-    # Chance, trotz des engen Limits durchzukommen statt hart zu failen.
-    client = anthropic.Anthropic(api_key=config.anthropic_api_key, max_retries=5)
+    # max_retries 3 (SDK-Default 2): 429/5xx werden vom SDK mit Backoff
+    # wiederholt; ein Wert darüber lässt einen einzelnen Turn minutenlang hängen.
+    client = anthropic.Anthropic(api_key=config.anthropic_api_key, max_retries=3)
     system_blocks = _build_system_blocks(agent_def)
 
     messages: list[dict[str, Any]] = _load_history(agent_def.name)
@@ -257,27 +360,10 @@ def run_agent(
                 messages=messages,
             )
         except anthropic.RateLimitError as exc:
+            # Nach den SDK-Retries immer noch 429 — Nachricht nicht persistieren,
+            # Manuel kann sie gleich nochmal schicken.
             logger.warning("Anthropic-Rate-Limit erreicht [%s]: %s", agent_def.name, exc)
-            detail = str(exc)
-            # ITPM-Fehler ("input tokens per minute") heißen: diese EINE Anfrage
-            # ist für sich allein schon größer als das Free-Tier-Limit (10K/Min).
-            # Warten behebt das NICHT — das braucht entweder ein Tier-Upgrade
-            # (console.anthropic.com/settings/billing) oder einen kleineren Prompt
-            # (kürzere Historie/Tool-Schemas). Reine RPM-Fehler ("requests per
-            # minute") sind dagegen meist transient und lösen sich von selbst.
-            if "input tokens per minute" in detail or "tokens per minute" in detail:
-                return (
-                    "Anthropic-Rate-Limit: Diese Anfrage ist allein schon größer als "
-                    "das Free-Tier-Limit (10K Input-Tokens/Minute) — das behebt sich "
-                    "NICHT durchs Warten. Manuel muss entweder auf "
-                    "console.anthropic.com/settings/billing eine Zahlungsmethode "
-                    "hinterlegen (höheres Limit) oder Claude Code bitten, den Prompt "
-                    "zu verkleinern."
-                )
-            return (
-                "Bin kurz am Anthropic-Rate-Limit (Free Tier) – probier's in ein, "
-                "zwei Minuten nochmal."
-            )
+            return "Bin kurz am Anthropic-Rate-Limit – probier's in ein, zwei Minuten nochmal."
         except anthropic.APIError as exc:
             raise Exception(f"Anthropic-API-Fehler: {exc}") from exc
 
@@ -312,28 +398,30 @@ def run_agent(
             if getattr(block, "type", None) != "tool_use":
                 continue
             tool_fn = tool_functions.get(block.name)
+            tool_input = block.input or {}
             if tool_fn is None:
                 result: Any = {"error": f"Unbekanntes Tool: {block.name}"}
             else:
                 try:
-                    result = tool_fn(**(block.input or {}))
+                    result = tool_fn(**tool_input)
                 except Exception as exc:  # Tool-Fehler an das Modell zurückgeben, nicht crashen
+                    logger.exception("Tool-Fehler in %s", block.name)
                     result = {"error": f"Tool-Fehler in {block.name}: {exc}"}
+            ok = not (isinstance(result, dict) and "error" in result)
+            _log_tool_call(agent_def.name, block.name, tool_input, result, ok)
             tool_results.append(
                 {
                     "type": "tool_result",
                     "tool_use_id": block.id,
-                    "content": json.dumps(result, ensure_ascii=False, default=str),
+                    "content": _serialize_tool_result(result),
                 }
             )
 
         messages.append({"role": "user", "content": tool_results})
     else:
-        # Iterationslimit erreicht, ohne finale Text-Antwort
-        final_text = (
-            "Ich brauche dafür zu viele Schritte und breche ab – frag mich gern "
-            "nochmal konkreter."
-        )
+        # Iterationslimit erreicht, ohne finale Text-Antwort — nicht persistieren.
+        logger.warning("Iterationslimit erreicht [%s]", agent_def.name)
+        return ABORT_TEXT
 
     if not final_text:
         final_text = "Dazu ist mir gerade keine Antwort eingefallen – frag nochmal anders."
