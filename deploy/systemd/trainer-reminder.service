@@ -1,0 +1,9 @@
+[Unit]
+Description=Trainer Reminder Check
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/manuel/personal-trainer-manuel
+ExecStart=/root/.local/bin/uv run python -m trainer.jobs.reminder_check
+StandardOutput=append:/root/manuel/personal-trainer-manuel/logs/reminder.log
+StandardError=append:/root/manuel/personal-trainer-manuel/logs/reminder.error.log

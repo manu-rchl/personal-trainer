@@ -1,0 +1,9 @@
+[Unit]
+Description=Trainer Oura Sync
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/manuel/personal-trainer-manuel
+ExecStart=/root/.local/bin/uv run python -m trainer.ingest.oura sync --days 7
+StandardOutput=append:/root/manuel/personal-trainer-manuel/logs/oura-sync.log
+StandardError=append:/root/manuel/personal-trainer-manuel/logs/oura-sync.error.log

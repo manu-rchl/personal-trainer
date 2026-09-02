@@ -1,0 +1,9 @@
+[Unit]
+Description=Trainer Hevy Sync (*-*-* 23:00:00)
+
+[Timer]
+OnCalendar=*-*-* 23:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

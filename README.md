@@ -104,25 +104,34 @@ eine ⚠️-Telegram-Nachricht raus und der Job endet mit Exit 1. Reminder und
 Report werden in `messages` persistiert (mit `[System: …]`-User-Turn), damit
 Isa im Chat weiß, was sie geschickt hat.
 
-## Betrieb (launchd, macOS)
+## Betrieb
+
+**Produktion = netcup-VPS** (`ssh netcup`, `/root/manuel/personal-trainer-manuel`,
+systemd). Der Mac ist nur Entwicklungsrechner — dort darf **kein** Bot laufen
+(gleicher Token → Telegram-Conflict, doppelte Reminder).
 
 ```bash
-bash deploy/install-launchd.sh     # kopiert, enabled, bootstrapped alle Agents
-bash deploy/uninstall-launchd.sh
-launchctl list | grep com.manuel.trainer
-tail -f ~/Library/Logs/trainer/bot.error.log   # Python-Logs gehen auf stderr
+bash deploy/deploy-vps.sh --dry-run   # zeigt, was rsync übertragen würde
+bash deploy/deploy-vps.sh             # stoppt Bot/Web, sichert DB, rsync, uv sync,
+                                      # Migration, Units installieren, Timer + Services starten
+ssh netcup tail -f /root/manuel/personal-trainer-manuel/logs/bot.error.log
+ssh netcup systemctl list-timers 'trainer-*'
 ```
 
-Bot und Web haben `KeepAlive` nur bei Crash (`SuccessfulExit=false`) und
-`ThrottleInterval 60` — ein Konfigurationsfehler beendet den Bot mit Exit 0
-und löst keinen Restart-Storm mehr aus (das hat das System im August 2026
-lahmgelegt). Das Install-Skript nutzt `launchctl enable`, weil ein
-persistenter `disabled`-Override von `launchctl load` nicht aufgehoben wird.
+Units liegen in `deploy/systemd/` (Bot/Web: `Restart=on-failure`,
+`RestartSec=60` — ein Konfigurationsfehler beendet mit Exit 0 und bleibt
+liegen, statt einen Restart-Storm auszulösen). Die DB wird nie übertragen;
+die VPS-DB ist die Quelle der Wahrheit. Für lokale Entwicklung eine Kopie
+holen: `scp netcup:/root/manuel/personal-trainer-manuel/data/trainer.db data/`.
 
-**Wenn eine ⚠️-Nachricht kommt:** Log des Jobs unter
-`~/Library/Logs/trainer/<job>.error.log` lesen; bei „Oura-Login abgelaufen"
-`uv run python -m trainer.ingest.oura auth` ausführen; bei fehlendem
-Bot-Heartbeat `launchctl kickstart -k gui/$UID/com.manuel.trainer.bot`.
+`deploy/*.plist` + `install-launchd.sh` sind das macOS-Pendant für
+Testbetrieb auf dem Mac — nur benutzen, wenn der VPS-Bot gestoppt ist.
+
+**Wenn eine ⚠️-Nachricht kommt:** Log des Jobs unter `logs/<job>.error.log`
+auf dem VPS lesen; bei „Oura-Login abgelaufen" auf dem VPS
+`uv run python -m trainer.ingest.oura auth` (braucht Browser → Token lokal
+erzeugen und die drei `secrets`-Zeilen übertragen); bei fehlendem
+Bot-Heartbeat `systemctl restart trainer-bot`.
 
 ## Tests
 
