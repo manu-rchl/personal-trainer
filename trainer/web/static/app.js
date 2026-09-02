@@ -116,13 +116,61 @@ function todayIso() {
   ).padStart(2, "0")}`;
 }
 
+/* ---------------------------------------------------------------------
+ * API-Zugriff: Bearer-Token (WEB_AUTH_TOKEN aus .env) wird einmal per
+ * prompt() abgefragt und in localStorage gehalten. Bei 401 wird er
+ * verworfen und neu abgefragt.
+ * --------------------------------------------------------------------- */
+
+const TOKEN_KEY = "trainer.webAuthToken";
+
+function readToken() {
+  try {
+    return localStorage.getItem(TOKEN_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+function askForToken(message) {
+  const token = window.prompt(message || "Zugangs-Token für das Dashboard (WEB_AUTH_TOKEN aus .env):");
+  if (!token) return "";
+  try {
+    localStorage.setItem(TOKEN_KEY, token.trim());
+  } catch {
+    /* privater Modus o.ä. — dann eben pro Seitenaufruf */
+  }
+  return token.trim();
+}
+
+async function apiFetch(url, options = {}) {
+  let token = readToken() || askForToken();
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const headers = { ...(options.headers || {}), Authorization: `Bearer ${token}` };
+    const res = await fetch(url, { ...options, headers });
+    if (res.status !== 401) return res;
+    try {
+      localStorage.removeItem(TOKEN_KEY);
+    } catch {
+      /* ignore */
+    }
+    token = askForToken("Token falsch oder abgelaufen — bitte erneut eingeben:");
+    if (!token) return res;
+  }
+  return fetch(url, { ...options, headers: { ...(options.headers || {}), Authorization: `Bearer ${token}` } });
+}
+
 async function fetchJson(url) {
   if (state.cache[url]) return state.cache[url];
-  const res = await fetch(url);
+  const res = await apiFetch(url);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
   state.cache[url] = data;
   return data;
+}
+
+function invalidateCache() {
+  state.cache = {};
 }
 
 /* ---------------------------------------------------------------------
@@ -783,12 +831,14 @@ async function renderChat(panel, agent) {
     typingEl.hidden = false;
 
     try {
-      const res = await fetch(`/api/chat/${agent}`, {
+      const res = await apiFetch(`/api/chat/${agent}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message: text }),
       });
       const data = await res.json();
+      // Isa kann im Turn geloggt/gespeichert haben — Dashboard-Daten neu holen.
+      invalidateCache();
       if (!document.body.contains(messagesEl)) return; // View gewechselt
 
       messagesEl.appendChild(
@@ -823,7 +873,7 @@ async function renderChat(panel, agent) {
   // Historie laden (bewusst NICHT aus dem Cache — neue Nachrichten sollen erscheinen)
   messagesEl.innerHTML = '<p class="empty-state">Lade Nachrichten …</p>';
   try {
-    const res = await fetch(`/api/chat/${agent}/history?limit=50`);
+    const res = await apiFetch(`/api/chat/${agent}/history?limit=50`);
     const history = await res.json();
     if (!document.body.contains(messagesEl)) return;
     messagesEl.innerHTML = "";
@@ -900,7 +950,9 @@ function metricCard(title, values, todayValue, unit, digits = 0, formatValue = f
 }
 
 function isoWeekLabel(mondayIso) {
-  const d = new Date(mondayIso + "T00:00:00");
+  // Durchgehend UTC rechnen: mit lokalem Datum + getUTC*-Methoden war in
+  // Europe/Berlin jedes Montag-00:00 ein Sonntag-22:00-UTC -> KW um 1 zu niedrig.
+  const d = new Date(mondayIso + "T00:00:00Z");
   const target = new Date(d.valueOf());
   const dayNr = (d.getUTCDay() + 6) % 7;
   target.setUTCDate(target.getUTCDate() - dayNr + 3);

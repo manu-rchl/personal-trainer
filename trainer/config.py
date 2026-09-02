@@ -47,6 +47,9 @@ class Config:
     # --- Hevy (Workout-Tracking) ---
     hevy_api_key: str = field(default_factory=lambda: _env("HEVY_API_KEY"))
 
+    # --- Web-Dashboard: Bearer-Token für alle /api/*-Routen ---
+    web_auth_token: str = field(default_factory=lambda: _env("WEB_AUTH_TOKEN"))
+
     # --- Datenbank ---
     db_path: Path = field(
         default_factory=lambda: Path(_env("DB_PATH", "data/trainer.db"))

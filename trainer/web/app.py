@@ -4,16 +4,23 @@ Bietet eine schlanke REST-API für Chat (delegiert an `trainer.agent.core.run_ag
 im Thread-Pool, da der Anthropic-Call blockierend ist) sowie einen
 Health-Overview-Endpoint, der Oura-/Workout-/Meal-Daten fürs Dashboard
 aufbereitet (Rohdaten pro `date` über die verschiedenen `oura_daily.kind`-Zeilen
-zusammengeführt). Läuft ausschließlich lokal (127.0.0.1) für Manuel als
-Single User — bewusst keine Auth, kein CORS für fremde Origins.
+zusammengeführt). Single-User, bindet lokal (127.0.0.1).
 
-Start (nur lokal binden!):
+Sicherheit: Alle `/api/*`-Routen verlangen `Authorization: Bearer
+<WEB_AUTH_TOKEN>` — der Web-Chat ist ein voller Agent mit Schreib-Tools
+(Hevy, Obsidian, Memories), und der Health-Overview enthält Gesundheitsdaten.
+Ohne Token wäre das für jeden lokalen Prozess und per DNS-Rebinding für jede
+Webseite erreichbar. Zusätzlich wird der Host-Header geprüft.
+
+Start:
     uv run uvicorn trainer.web.app:app --host 127.0.0.1 --port 8090
 """
 
 from __future__ import annotations
 
 import asyncio
+import hmac
+import logging
 from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -30,25 +37,53 @@ from trainer.agents import AGENTS
 from trainer.config import config
 from trainer.db import get_connection, init_db
 from trainer.exercise_norm import canonicalize
+from trainer.logging_setup import configure_logging
+
+logger = logging.getLogger(__name__)
+
+CHAT_TIMEOUT_S = 240
+HISTORY_LIMIT_MAX = 200
+ALLOWED_HOSTS = frozenset({"127.0.0.1", "localhost"})
 
 app = FastAPI(title="Agent Hub")
 
-# Prozess-Einstiegspunkt: Schema + Migrationen einmal beim Import (uvicorn
-# importiert das Modul genau einmal pro Worker), nicht pro Request.
+# Prozess-Einstiegspunkt: Logging + Schema/Migrationen einmal beim Import
+# (uvicorn importiert das Modul genau einmal pro Worker), nicht pro Request.
+configure_logging()
 init_db()
+if not config.web_auth_token:
+    raise RuntimeError(
+        "WEB_AUTH_TOKEN ist nicht gesetzt (siehe .env.example) — ohne Token startet "
+        "das Web-Dashboard nicht, weil der Chat-Endpoint ein voller Agent mit "
+        "Schreib-Tools ist."
+    )
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
-@app.middleware("http")
-async def _no_cache_static(request, call_next):
-    """Erzwingt Revalidierung für index.html/app.js/style.css.
+def _host_allowed(host_header: str | None) -> bool:
+    if not host_header:
+        return False
+    host = host_header.rsplit(":", 1)[0] if ":" in host_header else host_header
+    return host in ALLOWED_HOSTS
 
-    Ohne explizite Cache-Control-Header greift Chromes Heuristik-Caching auf
-    Basis von Last-Modified — nach einem Deploy zeigt der Browser dann
-    stillschweigend die alte Version, bis manuell hart neu geladen wird.
-    """
+
+@app.middleware("http")
+async def _auth_and_headers(request, call_next):
+    """Bearer-Auth für /api/*, Host-Check, Cache-Control für die Statics."""
+    if not _host_allowed(request.headers.get("host")):
+        return JSONResponse(status_code=421, content={"error": "Host nicht erlaubt."})
+
+    if request.url.path.startswith("/api/"):
+        auth = request.headers.get("authorization", "")
+        token = auth[7:] if auth.startswith("Bearer ") else ""
+        if not token or not hmac.compare_digest(token, config.web_auth_token):
+            return JSONResponse(status_code=401, content={"error": "Token fehlt oder falsch."})
+
     response = await call_next(request)
+    # Ohne explizite Cache-Control-Header greift Chromes Heuristik-Caching auf
+    # Basis von Last-Modified — nach einem Deploy zeigt der Browser dann
+    # stillschweigend die alte Version, bis manuell hart neu geladen wird.
     if request.url.path in ("/", "/app.js", "/style.css", "/index.html"):
         response.headers["Cache-Control"] = "no-cache, must-revalidate"
     return response
@@ -78,6 +113,7 @@ def chat_history(agent: str, limit: int = 50) -> list[dict[str, Any]]:
     """Letzte `limit` Nachrichten des Agenten, chronologisch (älteste zuerst)."""
     if agent not in AGENTS:
         raise HTTPException(status_code=404, detail=f"Unbekannter Agent: {agent}")
+    limit = max(1, min(limit, HISTORY_LIMIT_MAX))
 
     conn = get_connection()
     try:
@@ -102,15 +138,25 @@ async def chat(agent: str, body: ChatMessage) -> JSONResponse:
     """Schickt eine Nachricht an den Agenten (echter Anthropic-Call) und liefert die Antwort.
 
     Läuft im Thread-Pool, da `run_agent` synchron/blockierend ist. Fehler werden
-    als {"error": str} mit Status 500 zurückgegeben — niemals ein Traceback an
-    den Client.
+    als {"error": str} zurückgegeben (Frontend erwartet dieses Feld) — niemals
+    ein Traceback an den Client. Hartes Timeout, damit ein hängender Turn den
+    Browser nicht ewig warten lässt.
     """
     if agent not in AGENTS:
-        raise HTTPException(status_code=404, detail=f"Unbekannter Agent: {agent}")
+        return JSONResponse(status_code=404, content={"error": f"Unbekannter Agent: {agent}"})
 
     try:
-        reply = await asyncio.to_thread(run_agent, body.message, agent=agent)
+        reply = await asyncio.wait_for(
+            asyncio.to_thread(run_agent, body.message, agent=agent), timeout=CHAT_TIMEOUT_S
+        )
+    except asyncio.TimeoutError:
+        logger.error("Web-Chat Timeout nach %ss", CHAT_TIMEOUT_S)
+        return JSONResponse(
+            status_code=504,
+            content={"error": f"Isa hat nach {CHAT_TIMEOUT_S}s nicht geantwortet — nochmal versuchen."},
+        )
     except Exception as exc:  # Fehler abfangen statt Traceback nach außen zu geben
+        logger.exception("Web-Chat fehlgeschlagen")
         return JSONResponse(status_code=500, content={"error": str(exc)})
 
     return JSONResponse(content={"reply": reply})
