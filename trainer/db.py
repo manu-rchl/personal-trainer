@@ -42,7 +42,8 @@ CREATE TABLE IF NOT EXISTS workouts (
     type TEXT,
     source TEXT,
     notes TEXT,
-    ext_id TEXT
+    ext_id TEXT,
+    checkin_sent_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS workout_sets (
@@ -96,12 +97,71 @@ CREATE TABLE IF NOT EXISTS memories (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts TEXT,
     category TEXT,
-    content TEXT
+    content TEXT,
+    source TEXT,
+    valid_from TEXT,
+    updated_at TEXT,
+    pinned INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS exercise_aliases (
     alias TEXT PRIMARY KEY,
     canonical TEXT NOT NULL
+);
+
+-- Coach-Kern (Phase 1): Plan + Ziele als DATEN statt Freitext in Memories.
+-- load_mode: wie `workout_sets.weight_kg` zu lesen ist (barbell_per_side |
+-- per_hand | total) — siehe trainer.analytics.effective_load.
+CREATE TABLE IF NOT EXISTS exercise_meta (
+    exercise TEXT PRIMARY KEY,
+    load_mode TEXT NOT NULL,
+    primary_muscle TEXT,
+    hevy_template_id TEXT,
+    updated_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS training_plan (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    active INTEGER NOT NULL DEFAULT 1,
+    name TEXT,
+    split TEXT,
+    days_per_week INTEGER,
+    block_start TEXT,
+    block_weeks INTEGER,
+    progression_rule TEXT,
+    deload_rule TEXT,
+    notes TEXT,
+    updated_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS exercise_targets (
+    exercise TEXT PRIMARY KEY,
+    target_weight_kg REAL,
+    rep_min INTEGER,
+    rep_max INTEGER,
+    sets INTEGER,
+    reason TEXT,
+    source TEXT,
+    updated_at TEXT
+);
+
+-- Follow-ups, die Isa sich selbst setzt ("Legs in Düsseldorf?"); der
+-- Post-Workout-Job schickt fällige als Agent-Turn raus.
+CREATE TABLE IF NOT EXISTS scheduled_checkins (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    due_date TEXT NOT NULL,
+    text TEXT NOT NULL,
+    created_ts TEXT,
+    sent_at TEXT
+);
+
+-- Rollende Zusammenfassung der Chat-Historie, die aus dem Kontextfenster
+-- gefallen ist (Phase 2).
+CREATE TABLE IF NOT EXISTS history_summaries (
+    agent TEXT PRIMARY KEY,
+    upto_message_id INTEGER NOT NULL,
+    summary TEXT NOT NULL,
+    updated_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS hevy_exercise_templates (
@@ -182,10 +242,66 @@ def _migration_2_secrets_and_cleanup(conn: sqlite3.Connection) -> None:
     conn.execute("DROP TABLE IF EXISTS health_metrics")
 
 
+DEFAULT_TRAINING_PLAN = {
+    "name": "PPL Basis",
+    "split": "Push / Pull / Legs (Hevy-Master-Routinen)",
+    "days_per_week": 3,
+    "block_weeks": 6,
+    "progression_rule": (
+        "Double Progression: Rep-Range pro Übung (Standard 8-12). Alle Arbeitssätze "
+        "sauber am oberen Ende -> kleinste Steigerung (Langhantel +1,25 kg pro Seite, "
+        "Kurzhantel +2,5 kg, Maschine/Kabel +1 Platte). Reps brechen ein -> halten. "
+        "3 Sessions ohne neues e1RM -> Plateau: Variante rotieren oder Deload."
+    ),
+    "deload_rule": (
+        "Alle 6-8 Wochen oder bei Plateau + Readiness-Tief (Oura < 60 an mehreren "
+        "Tagen): eine Woche ~60 % Last, gleiche Übungen."
+    ),
+    "notes": "Seed aus Phase 1 (2026-09-03). Über set_training_plan anpassen.",
+}
+
+
+def _migration_3_coach_core(conn: sqlite3.Connection) -> None:
+    """Phase 1: Spalten für Check-in-Dedupe und Memory-Metadaten, Plan-Seed.
+
+    Bestehende Workouts gelten als 'Check-in erledigt', sonst würde der
+    Post-Workout-Job beim ersten Lauf alle Alt-Workouts abarbeiten.
+    """
+    if not _has_column(conn, "workouts", "checkin_sent_at"):
+        conn.execute("ALTER TABLE workouts ADD COLUMN checkin_sent_at TEXT")
+    conn.execute(
+        "UPDATE workouts SET checkin_sent_at = COALESCE(checkin_sent_at, 'migrated-3')"
+    )
+    for col, ddl in (
+        ("source", "TEXT"),
+        ("valid_from", "TEXT"),
+        ("updated_at", "TEXT"),
+        ("pinned", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if not _has_column(conn, "memories", col):
+            conn.execute(f"ALTER TABLE memories ADD COLUMN {col} {ddl}")
+    if conn.execute("SELECT COUNT(*) FROM training_plan").fetchone()[0] == 0:
+        conn.execute(
+            "INSERT INTO training_plan (active, name, split, days_per_week, block_start, "
+            "block_weeks, progression_rule, deload_rule, notes, updated_at) "
+            "VALUES (1, ?, ?, ?, date('now'), ?, ?, ?, ?, datetime('now'))",
+            (
+                DEFAULT_TRAINING_PLAN["name"],
+                DEFAULT_TRAINING_PLAN["split"],
+                DEFAULT_TRAINING_PLAN["days_per_week"],
+                DEFAULT_TRAINING_PLAN["block_weeks"],
+                DEFAULT_TRAINING_PLAN["progression_rule"],
+                DEFAULT_TRAINING_PLAN["deload_rule"],
+                DEFAULT_TRAINING_PLAN["notes"],
+            ),
+        )
+
+
 # (Versionsnummer, Funktion). Neue Migrationen unten anhängen, Nummer +1.
 MIGRATIONS: list[tuple[int, Callable[[sqlite3.Connection], None]]] = [
     (1, _migration_1_legacy_columns),
     (2, _migration_2_secrets_and_cleanup),
+    (3, _migration_3_coach_core),
 ]
 
 SCHEMA_VERSION = MIGRATIONS[-1][0]

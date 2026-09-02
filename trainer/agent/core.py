@@ -202,37 +202,60 @@ def _agent_lock(agent: str) -> Iterator[None]:
             fd.close()
 
 
-def _load_memories_for_prompt() -> list[dict[str, Any]]:
+def _load_memories_for_prompt() -> dict[str, Any]:
+    """Gepinnte Memories immer, dazu die neuesten bis zum Limit."""
     conn = get_connection()
     try:
         total = conn.execute("SELECT COUNT(*) AS n FROM memories").fetchone()["n"]
+        pinned = conn.execute(
+            "SELECT id, category, content, source FROM memories WHERE pinned = 1 ORDER BY id"
+        ).fetchall()
         limit = total if total < MEMORY_INLINE_LIMIT else MEMORY_INLINE_RECENT
-        rows = conn.execute(
-            "SELECT category, content FROM memories ORDER BY id DESC LIMIT ?",
+        recent = conn.execute(
+            "SELECT id, category, content, source FROM memories WHERE pinned = 0 "
+            "ORDER BY id DESC LIMIT ?",
             (limit,),
         ).fetchall()
-        return {"total": total, "rows": [dict(r) for r in rows]}
+        return {"total": total, "pinned": [dict(r) for r in pinned], "rows": [dict(r) for r in recent]}
     finally:
         conn.close()
+
+
+def _memory_line(r: dict[str, Any]) -> str:
+    src = f" (Quelle: {r['source']})" if r.get("source") else ""
+    return f"- #{r['id']} [{r['category']}] {r['content']}{src}"
 
 
 def _build_memories_text() -> str:
     data = _load_memories_for_prompt()
     total = data["total"]
-    rows = data["rows"]
-
     if total == 0:
         return "(noch keine Memories gespeichert)"
 
-    lines = [f"- [{r['category']}] {r['content']}" for r in rows]
-    text = "\n".join(lines)
+    parts: list[str] = []
+    if data["pinned"]:
+        parts.append("Kernfakten (gepinnt):\n" + "\n".join(_memory_line(r) for r in data["pinned"]))
+    if data["rows"]:
+        parts.append("Weitere Memories (neueste zuerst):\n" + "\n".join(_memory_line(r) for r in data["rows"]))
+    text = "\n\n".join(parts)
 
     if total >= MEMORY_INLINE_LIMIT:
         text += (
-            f"\n\n({total} Memories insgesamt — hier nur die {MEMORY_INLINE_RECENT} "
+            f"\n\n({total} Memories insgesamt — hier nur gepinnte + die {MEMORY_INLINE_RECENT} "
             "neuesten. Nutze search_memories für ältere oder gezielte Suche.)"
         )
     return text
+
+
+def _load_history_summary(agent: str) -> str | None:
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT summary FROM history_summaries WHERE agent = ?", (agent,)
+        ).fetchone()
+        return row["summary"] if row else None
+    finally:
+        conn.close()
 
 
 def _build_system_blocks(agent_def: AgentDef) -> list[dict[str, Any]]:
@@ -259,6 +282,9 @@ def _build_system_blocks(agent_def: AgentDef) -> list[dict[str, Any]]:
     dynamic_text = DYNAMIC_CONTEXT_TEMPLATE.format(
         today=today, profile=profile_text, memories=_build_memories_text()
     )
+    summary = _load_history_summary(agent_def.name)
+    if summary:
+        dynamic_text += f"\n\nZusammenfassung älterer Gespräche (nicht mehr im Verlauf):\n{summary}"
 
     return [
         {
@@ -284,17 +310,24 @@ def _extract_text(content_blocks: list[Any]) -> str:
 
 
 def run_agent(
-    user_message: str, image: tuple[str, bytes] | None = None, agent: str = "isa"
+    user_message: str,
+    image: tuple[str, bytes] | None = None,
+    agent: str = "isa",
+    persist: bool = True,
 ) -> str:
     """Führt eine Runde des angegebenen Agenten aus und liefert die finale Antwort.
 
     Hält währenddessen den prozessübergreifenden Agent-Lock (Bot und Web-Chat
     dürfen nicht gleichzeitig auf derselben Historie arbeiten). Bei Lock-Timeout
     kommt eine freundliche Meldung statt einer Exception.
+
+    `persist=False`: Turn NICHT in die Historie schreiben — für Jobs, die die
+    Antwort erst prüfen (z.B. `NO_MESSAGE`) und selbst über persist_exchange
+    persistieren.
     """
     try:
         with _agent_lock(agent):
-            return _run_agent_unlocked(user_message, image, agent)
+            return _run_agent_unlocked(user_message, image, agent, persist=persist)
     except TimeoutError as exc:
         logger.warning("Agent-Lock-Timeout [%s]: %s", agent, exc)
         return (
@@ -304,7 +337,7 @@ def run_agent(
 
 
 def _run_agent_unlocked(
-    user_message: str, image: tuple[str, bytes] | None, agent: str
+    user_message: str, image: tuple[str, bytes] | None, agent: str, persist: bool = True
 ) -> str:
     """Eigentlicher Agent-Turn (ohne Lock — nur über run_agent aufrufen).
 
@@ -441,7 +474,8 @@ def _run_agent_unlocked(
             f"{user_message}\n\n[Foto gesendet]" if user_message else "[Foto gesendet]"
         )
 
-    _persist_message("user", persisted_user_text, agent_def.name)
-    _persist_message("assistant", final_text, agent_def.name)
+    if persist:
+        _persist_message("user", persisted_user_text, agent_def.name)
+        _persist_message("assistant", final_text, agent_def.name)
 
     return final_text

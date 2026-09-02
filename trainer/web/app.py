@@ -21,7 +21,6 @@ from __future__ import annotations
 import asyncio
 import hmac
 import logging
-from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -31,12 +30,12 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from trainer import analytics
 from trainer.agent.core import run_agent
 from trainer.agent.tools import get_calendar, get_meals, get_workouts
 from trainer.agents import AGENTS
 from trainer.config import config
 from trainer.db import get_connection, init_db
-from trainer.exercise_norm import canonicalize
 from trainer.logging_setup import configure_logging
 
 logger = logging.getLogger(__name__)
@@ -220,28 +219,7 @@ def health_overview(days: int = 30) -> dict[str, Any]:
             )
 
         # --- workouts_per_week: letzte 8 Wochen (Montag-Start), auch leer ---
-        current_monday = today - timedelta(days=today.weekday())
-        week_starts = [current_monday - timedelta(weeks=n) for n in range(7, -1, -1)]
-        week_cutoff = week_starts[0].isoformat()
-        workout_rows = conn.execute(
-            "SELECT date FROM workouts WHERE date IS NOT NULL AND date >= ?",
-            (week_cutoff,),
-        ).fetchall()
-        week_counts = {ws.isoformat(): 0 for ws in week_starts}
-        for wr in workout_rows:
-            raw = wr["date"]
-            if not raw:
-                continue
-            try:
-                d = date.fromisoformat(str(raw)[:10])
-            except ValueError:
-                continue
-            monday = (d - timedelta(days=d.weekday())).isoformat()
-            if monday in week_counts:
-                week_counts[monday] += 1
-        workouts_per_week = [
-            {"week": ws.isoformat(), "count": week_counts[ws.isoformat()]} for ws in week_starts
-        ]
+        workouts_per_week = analytics.workouts_per_week(conn, weeks=8, today=today)
 
         # --- meals_daily: letzte 14 Tage ---
         meal_cutoff = (today - timedelta(days=13)).isoformat()
@@ -452,19 +430,14 @@ def workouts(
     if exercise:
         conn = get_connection()
         try:
-            name_rows = conn.execute(
-                "SELECT DISTINCT exercise FROM workout_sets WHERE exercise IS NOT NULL"
-            ).fetchall()
-            alias_rows = conn.execute("SELECT alias, canonical FROM exercise_aliases").fetchall()
+            canon_map = analytics.build_canon_map(conn)
         finally:
             conn.close()
-        all_names = [r["exercise"] for r in name_rows]
-        alias_map = {r["alias"]: r["canonical"] for r in alias_rows}
         filtered = [
             w
             for w in filtered
             if any(
-                canonicalize(s.get("exercise") or "", all_names, alias_map) == exercise
+                canon_map.get(s.get("exercise") or "", s.get("exercise")) == exercise
                 for s in (w.get("sets") or [])
             )
         ]
@@ -493,202 +466,44 @@ def meals(days: int = 30) -> dict[str, Any]:
     return get_meals(days)
 
 
-def _grouped_exercise_points(
-    conn: Any,
-) -> tuple[dict[str, list[dict[str, Any]]], dict[str, str]]:
-    """Gruppiert alle Sätze über `canonicalize` und liefert pro kanonischer Übung
-    die chronologische Punkte-Liste (ein Punkt pro Workout-Datum: schwerster Satz)
-    sowie die dominante Trainings-Kategorie (workouts.type).
-
-    "Schwerster Satz" = höchstes weight_kg, bei Gleichstand die meisten reps.
-    est_1rm nach Epley: weight * (1 + reps/30). `set_count` je Punkt zählt alle
-    Sätze dieser Übung am jeweiligen Tag (nicht nur den schwersten).
-
-    Kategorie = Modus von workouts.type über alle Sessions (Workouts), die die
-    Übung enthalten — pro Session (workout_id) genau ein Vote, nicht pro Satz,
-    damit ein Workout mit vielen Sätzen die Kategorie nicht überstimmt. Leerer/
-    NULL type zählt als "Sonstige".
-    """
-    rows = conn.execute(
-        """
-        SELECT w.id AS workout_id, w.date AS date, w.type AS type,
-               s.exercise AS exercise, s.weight_kg AS weight_kg, s.reps AS reps
-        FROM workout_sets s
-        JOIN workouts w ON s.workout_id = w.id
-        WHERE s.exercise IS NOT NULL AND w.date IS NOT NULL AND s.weight_kg IS NOT NULL
-        ORDER BY w.date
-        """
-    ).fetchall()
-
-    alias_rows = conn.execute("SELECT alias, canonical FROM exercise_aliases").fetchall()
-    alias_map = {r["alias"]: r["canonical"] for r in alias_rows}
-
-    all_names = [r["exercise"] for r in rows]
-    canon_cache: dict[str, str] = {}
-
-    # canonical -> date -> (weight_kg, reps, set_count) — schwerster Satz + Satzzahl je Tag
-    per_group_per_date: dict[str, dict[str, tuple[float, int | None, int]]] = {}
-    # canonical -> workout_id -> type — ein Vote pro Session, nicht pro Satz
-    category_sessions: dict[str, dict[int, str | None]] = {}
-
-    for r in rows:
-        raw = r["exercise"]
-        canon = canon_cache.get(raw)
-        if canon is None:
-            canon = canonicalize(raw, all_names, alias_map)
-            canon_cache[raw] = canon
-
-        d = str(r["date"])[:10]
-        w = float(r["weight_kg"])
-        reps = r["reps"]
-
-        per_date = per_group_per_date.setdefault(canon, {})
-        current = per_date.get(d)
-        if current is None:
-            per_date[d] = (w, reps, 1)
-        elif w > current[0] or (w == current[0] and (reps or 0) > (current[1] or 0)):
-            per_date[d] = (w, reps, current[2] + 1)
-        else:
-            per_date[d] = (current[0], current[1], current[2] + 1)
-
-        category_sessions.setdefault(canon, {})[r["workout_id"]] = r["type"]
-
-    result: dict[str, list[dict[str, Any]]] = {}
-    for canon, per_date in per_group_per_date.items():
-        points: list[dict[str, Any]] = []
-        for d in sorted(per_date.keys()):
-            w, reps, set_count = per_date[d]
-            est_1rm = round(w * (1 + (reps or 0) / 30), 1)
-            points.append(
-                {
-                    "date": d,
-                    "top_weight_kg": _round(w),
-                    "top_reps": reps,
-                    "est_1rm": est_1rm,
-                    "set_count": set_count,
-                }
-            )
-        result[canon] = points
-
-    categories: dict[str, str] = {}
-    for canon, sessions in category_sessions.items():
-        counts = Counter(
-            (t.strip() if t and t.strip() else "Sonstige") for t in sessions.values()
-        )
-        categories[canon] = counts.most_common(1)[0][0]
-
-    return result, categories
-
-
 @app.get("/api/exercises")
 def list_exercises() -> list[dict[str, Any]]:
-    """Kanonische Übungen mit Session-Anzahl (Workout-Tage), letztem Gewicht und
-    dominanter Trainings-Kategorie (workouts.type), sortiert nach Häufigkeit
-    (sessions DESC). Namensvarianten (Strong vs. Hevy) fallen dank `canonicalize`
-    zu einer Zeile zusammen."""
+    """Kanonische Übungen mit Session-Anzahl, PR (effektive Last), Load-Modus,
+    Plateau-Flag und Zielgewicht — alles aus `trainer.analytics`."""
     conn = get_connection()
     try:
-        grouped, categories = _grouped_exercise_points(conn)
+        return analytics.exercise_summaries(conn)
     finally:
         conn.close()
-
-    items = []
-    for name, points in grouped.items():
-        # PR = Datum des ERSTEN Erreichens des Maximalgewichts (nicht der
-        # letzten Wiederholung), damit ein "Neuer PR"-Badge den echten
-        # Fortschrittsmoment zeigt statt eines zufälligen späteren Tages mit
-        # gleichem Gewicht.
-        pr_weight_kg: float | None = None
-        pr_date: str | None = None
-        pr_est_1rm: float | None = None
-        running_max = float("-inf")
-        for p in points:
-            w = p["top_weight_kg"]
-            if w is not None and w > running_max:
-                running_max = w
-                pr_weight_kg, pr_date, pr_est_1rm = w, p["date"], p["est_1rm"]
-
-        items.append(
-            {
-                "name": name,
-                "sessions": len(points),
-                "last_weight_kg": points[-1]["top_weight_kg"] if points else None,
-                "category": categories.get(name, "Sonstige"),
-                "pr_weight_kg": pr_weight_kg,
-                "pr_date": pr_date,
-                "pr_est_1rm": pr_est_1rm,
-            }
-        )
-    items.sort(key=lambda x: x["sessions"], reverse=True)
-    return items
 
 
 @app.get("/api/exercise/progress")
 def exercise_progress(name: str) -> dict[str, Any]:
-    """Gewichts-Verlauf einer kanonischen Übung: pro Workout-Datum der schwerste Satz
-    inkl. Satzzahl (chronologisch), Varianten via `canonicalize` gemergt. Leere Liste
-    bei unbekannter Übung."""
+    """Verlauf einer kanonischen Übung: pro Session der schwerste Satz, effektive
+    Last, e1RM (auf effektiver Last), Satzzahl. Leere Liste bei unbekannter Übung."""
     conn = get_connection()
     try:
-        grouped, _categories = _grouped_exercise_points(conn)
+        points, _categories, metas = analytics.exercise_points(conn)
+        target = analytics.get_target(conn, name)
     finally:
         conn.close()
-
-    return {"name": name, "points": grouped.get(name, [])}
+    meta = metas.get(name) or {}
+    return {
+        "name": name,
+        "load_mode": meta.get("load_mode"),
+        "target_weight_kg": target["target_weight_kg"] if target else None,
+        "points": points.get(name, []),
+    }
 
 
 @app.get("/api/training/volume")
 def training_volume(weeks: int = 12) -> dict[str, Any]:
-    """Trainingsvolumen (Summe weight_kg × reps) pro Kalenderwoche (Montag-Start),
-    auch leere Wochen mit 0 — gleiches Zero-Fill-Pattern wie `workouts_per_week`
-    in `health_overview`, nur über `workout_sets` statt `workouts` aggregiert."""
+    """Effektives Trainingsvolumen pro Kalenderwoche (Montag-Start), Zero-Fill."""
     conn = get_connection()
     try:
-        today = date.today()
-        current_monday = today - timedelta(days=today.weekday())
-        week_starts = [current_monday - timedelta(weeks=n) for n in range(weeks - 1, -1, -1)]
-        cutoff = week_starts[0].isoformat()
-
-        rows = conn.execute(
-            """
-            SELECT w.date AS date, w.id AS workout_id, s.weight_kg AS weight_kg, s.reps AS reps
-            FROM workout_sets s
-            JOIN workouts w ON s.workout_id = w.id
-            WHERE w.date IS NOT NULL AND w.date >= ?
-              AND s.weight_kg IS NOT NULL AND s.reps IS NOT NULL
-            """,
-            (cutoff,),
-        ).fetchall()
+        return {"weeks": weeks, "volume_per_week": analytics.weekly_volume(conn, weeks=weeks)}
     finally:
         conn.close()
-
-    buckets: dict[str, dict[str, Any]] = {
-        ws.isoformat(): {"volume_kg": 0.0, "set_count": 0, "workout_ids": set()}
-        for ws in week_starts
-    }
-    for r in rows:
-        try:
-            d = date.fromisoformat(str(r["date"])[:10])
-        except ValueError:
-            continue
-        monday = (d - timedelta(days=d.weekday())).isoformat()
-        bucket = buckets.get(monday)
-        if bucket is None:
-            continue
-        bucket["volume_kg"] += float(r["weight_kg"]) * float(r["reps"])
-        bucket["set_count"] += 1
-        bucket["workout_ids"].add(r["workout_id"])
-
-    volume_per_week = [
-        {
-            "week": ws.isoformat(),
-            "volume_kg": _round(buckets[ws.isoformat()]["volume_kg"], 0),
-            "set_count": buckets[ws.isoformat()]["set_count"],
-            "workout_count": len(buckets[ws.isoformat()]["workout_ids"]),
-        }
-        for ws in week_starts
-    ]
-    return {"weeks": weeks, "volume_per_week": volume_per_week}
 
 
 # Statische Dateien (index.html, style.css, app.js) unter / — MUSS nach den

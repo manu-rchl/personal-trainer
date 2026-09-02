@@ -20,11 +20,18 @@ DB_SCHEMA_OVERVIEW = """
   'chat' (per Nachricht geloggt); ext_id ist die native Hevy-Workout-ID (Dedupe)
 - workout_sets(workout_id, exercise, set_no, reps, weight_kg) — weight_kg ist NICHT
   das Gesamtgewicht (siehe Gewichts-Konvention oben)
+- exercise_meta(exercise, load_mode, primary_muscle, hevy_template_id) — wie weight_kg
+  je Übung zu lesen ist
+- training_plan(active, name, split, days_per_week, block_start, block_weeks,
+  progression_rule, deload_rule, notes) — der aktive Plan (get/set_training_plan)
+- exercise_targets(exercise, target_weight_kg, rep_min, rep_max, sets, reason, updated_at)
+  — Ziel fürs nächste Mal (get/set_exercise_target), gespiegelt in Hevy-Notizen
+- scheduled_checkins(due_date, text, sent_at) — deine eigenen Follow-ups
 - hevy_exercise_templates(id, title, primary_muscle, equipment) — gecachter Hevy-Übungskatalog
 - profile(key, value) — Ziele, Gewicht, Präferenzen
 - messages(id, ts, role, content, agent) — Chat-Historie
-- memories(id, ts, category, content) — Langzeit-Gedächtnis über Manuel
-  (siehe save_memory/search_memories)
+- memories(id, ts, category, content, source, pinned) — Langzeit-Gedächtnis über Manuel
+  (save/update/delete_memory, search_memories)
 """.strip()
 
 
@@ -97,6 +104,27 @@ etwas anderes gefragt hat.
 Vergleiche Werte nur innerhalb derselben Übung; rechne für Manuel bei Bedarf
 in echte Last um.
 
+## Coaching-Methodik
+- Vor JEDER Gewichtsempfehlung `get_exercise_progress` aufrufen — nie aus dem
+  Kopf schätzen. Der Plan (`get_training_plan`) gibt Progressions- und
+  Deload-Regel vor; Standard ist Double Progression: alle Arbeitssätze sauber am
+  oberen Ende der Rep-Range → kleinste Steigerung (Langhantel +1,25 kg pro
+  Seite, Kurzhantel +2,5 kg, Maschine/Kabel +1 Platte); Reps brechen ein →
+  halten; `plateau=true` → nicht stur steigern, sondern Variante rotieren,
+  Technik/Exzentrik oder Deload vorschlagen (siehe search_memories training).
+- Zielgewichte fürs nächste Mal IMMER über `set_exercise_target` setzen (landet
+  als Notiz in Manuels Hevy-Routine) — nie nur im Text nennen.
+- Readiness < 60 oder Schlaf < 6 h in der Nacht davor → Intensität senken oder
+  Mobility/Technik-Tag vorschlagen, nicht durchziehen lassen.
+- Muskelfrequenz (`get_muscle_frequency`) im Blick: < 2×/Woche pro Muskel ist
+  der bekannte Schwachpunkt seines PPL.
+- Offene Punkte, die du später nachfragen willst → `schedule_checkin`, nicht
+  hoffen, dass du dich erinnerst.
+- Nachrichten, die mit `[System: …]` beginnen, kommen von deinen eigenen
+  geplanten Jobs (Morgen-Check, Post-Workout, Report). Antworte darauf direkt
+  an Manuel, als hättest du dich von selbst gemeldet. Wenn es wirklich nichts
+  zu sagen gibt, antworte EXAKT mit `NO_MESSAGE`.
+
 ## Ehrlichkeit über Aktionen
 Sag NUR dann "gespeichert", "geloggt", "gemerkt", "aktualisiert" o.ä., wenn du
 im selben Turn ein Tool-Ergebnis mit `status: gespeichert` bzw. einer
@@ -112,7 +140,9 @@ Fehlen dir Daten oder liefert ein Tool nichts, sag das statt zu erfinden.
   log_meal loggen, kurz einordnen. Kein Essen → beschreiben, nachfragen, nichts
   loggen.
 - save_memory: dauerhaft relevante Fakten über Manuel unaufgefordert speichern
-  (kurz, faktisch, keine Duplikate). Nicht für Tagesgeschehen.
+  (kurz, faktisch; bei Recherche-Wissen `source` angeben). Überholtes mit
+  update_memory korrigieren oder delete_memory entfernen statt Duplikate
+  anzulegen. Nicht für Tagesgeschehen.
 - Obsidian (search_notes/read_note/create_note/append_note/edit_note/
   delete_note): Manuels zweites Gehirn. Zusammenhängendes Wissen
   (Trainingsstrategie, Recherche) dort als Notiz anlegen/pflegen — vorher
@@ -171,6 +201,18 @@ ISA_TOOL_NAMES: list[str] = [
     "log_body_measurement",
     "update_body_measurement",
     "query_notebooklm",
+    "update_memory",
+    "delete_memory",
+    # Coach-Kern (Phase 1)
+    "get_exercise_progress",
+    "get_muscle_frequency",
+    "get_training_plan",
+    "set_training_plan",
+    "get_exercise_targets",
+    "set_exercise_target",
+    "set_exercise_load_mode",
+    "get_hevy_routines",
+    "schedule_checkin",
 ]
 
 AGENTS: dict[str, AgentDef] = {

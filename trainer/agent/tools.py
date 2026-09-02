@@ -398,14 +398,21 @@ def update_profile(key: str, value: str) -> dict[str, Any]:
 MAX_MEMORY_SEARCH_ROWS = 50
 
 
-def save_memory(content: str, category: str) -> dict[str, Any]:
-    """Speichert ein dauerhaft relevantes Fakt über Manuel im Langzeit-Gedächtnis."""
+def save_memory(
+    content: str, category: str, source: str | None = None, pinned: bool = False
+) -> dict[str, Any]:
+    """Speichert ein dauerhaft relevantes Fakt über Manuel im Langzeit-Gedächtnis.
+
+    `source`: Herkunft bei recherchiertem Wissen (z.B. "NotebookLM NB1, 2026-09-03").
+    `pinned`: Kernfakt, der IMMER im Prompt steht (Verletzungen, Konventionen, Ziele).
+    """
     ts = datetime.now(timezone.utc).isoformat()
     conn = get_connection()
     try:
         cur = conn.execute(
-            "INSERT INTO memories (ts, category, content) VALUES (?, ?, ?)",
-            (ts, category, content),
+            "INSERT INTO memories (ts, category, content, source, valid_from, updated_at, pinned) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (ts, category, content, source, ts[:10], ts, 1 if pinned else 0),
         )
         conn.commit()
         return {
@@ -413,8 +420,61 @@ def save_memory(content: str, category: str) -> dict[str, Any]:
             "ts": ts,
             "category": category,
             "content": content,
+            "source": source,
+            "pinned": bool(pinned),
             "status": "gespeichert",
         }
+    finally:
+        conn.close()
+
+
+def update_memory(
+    memory_id: int,
+    content: str | None = None,
+    category: str | None = None,
+    pinned: bool | None = None,
+    source: str | None = None,
+) -> dict[str, Any]:
+    """Korrigiert/ergänzt ein bestehendes Memory (nur übergebene Felder)."""
+    updates: dict[str, Any] = {}
+    if content is not None:
+        updates["content"] = content
+    if category is not None:
+        updates["category"] = category
+    if pinned is not None:
+        updates["pinned"] = 1 if pinned else 0
+    if source is not None:
+        updates["source"] = source
+    if not updates:
+        return {"error": "Nichts zu ändern (content/category/pinned/source angeben)."}
+    conn = get_connection()
+    try:
+        if not conn.execute("SELECT 1 FROM memories WHERE id = ?", (memory_id,)).fetchone():
+            return {"error": f"Memory #{memory_id} existiert nicht."}
+        sets = ", ".join(f"{k} = ?" for k in updates)
+        conn.execute(
+            f"UPDATE memories SET {sets}, updated_at = ? WHERE id = ?",
+            (*updates.values(), datetime.now(timezone.utc).isoformat(), memory_id),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT id, category, content, source, pinned FROM memories WHERE id = ?", (memory_id,)
+        ).fetchone()
+        return {"status": "gespeichert", "memory": dict(row)}
+    finally:
+        conn.close()
+
+
+def delete_memory(memory_id: int) -> dict[str, Any]:
+    """Löscht ein Memory endgültig (z.B. veraltet oder Duplikat)."""
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT content FROM memories WHERE id = ?", (memory_id,)).fetchone()
+        if not row:
+            return {"error": f"Memory #{memory_id} existiert nicht."}
+        conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+        conn.commit()
+        return {"status": "gelöscht", "memory_id": memory_id, "content": row["content"]}
     finally:
         conn.close()
 
@@ -426,7 +486,7 @@ def search_memories(query: str | None = None, category: str | None = None) -> di
     """
     conn = get_connection()
     try:
-        sql = "SELECT id, ts, category, content FROM memories WHERE 1=1"
+        sql = "SELECT id, ts, category, content, source, pinned FROM memories WHERE 1=1"
         params: list[Any] = []
         if query:
             sql += " AND content LIKE ?"
@@ -1595,11 +1655,43 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "type": "string",
                     "description": (
                         "Kategorie, z.B. 'person', 'gesundheit', 'vorlieben', "
-                        "'arbeit', 'ziele'."
+                        "'arbeit', 'ziele', 'training', 'nutrition', 'mobility'."
                     ),
+                },
+                "source": {
+                    "type": "string",
+                    "description": "Herkunft bei recherchiertem Wissen, z.B. 'NotebookLM NB1, 2026-09-03'.",
+                },
+                "pinned": {
+                    "type": "boolean",
+                    "description": "true nur für Kernfakten, die immer im Prompt stehen sollen.",
                 },
             },
             "required": ["content", "category"],
+        },
+    },
+    {
+        "name": "update_memory",
+        "description": "Korrigiert ein bestehendes Memory (Inhalt, Kategorie, pinned, Quelle) statt ein Duplikat anzulegen.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "memory_id": {"type": "integer"},
+                "content": {"type": "string"},
+                "category": {"type": "string"},
+                "pinned": {"type": "boolean"},
+                "source": {"type": "string"},
+            },
+            "required": ["memory_id"],
+        },
+    },
+    {
+        "name": "delete_memory",
+        "description": "Löscht ein veraltetes oder doppeltes Memory endgültig.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"memory_id": {"type": "integer"}},
+            "required": ["memory_id"],
         },
     },
     {
@@ -2087,6 +2179,8 @@ TOOL_FUNCTIONS: dict[str, Callable[..., dict[str, Any]]] = {
     "log_meal": log_meal,
     "get_meals": get_meals,
     "save_memory": save_memory,
+    "update_memory": update_memory,
+    "delete_memory": delete_memory,
     "search_memories": search_memories,
     "query_notebooklm": query_notebooklm,
     "get_calendar": get_calendar,
@@ -2105,3 +2199,13 @@ TOOL_FUNCTIONS: dict[str, Callable[..., dict[str, Any]]] = {
     "log_body_measurement": log_body_measurement,
     "update_body_measurement": update_body_measurement,
 }
+
+
+# ---------------------------------------------------------------------------
+# Coach-Tools (Phase 1) — eigenes Modul, hier nur registriert.
+# ---------------------------------------------------------------------------
+
+from trainer.agent.coach_tools import COACH_TOOL_FUNCTIONS, COACH_TOOL_SCHEMAS  # noqa: E402
+
+TOOL_SCHEMAS.extend(COACH_TOOL_SCHEMAS)
+TOOL_FUNCTIONS.update(COACH_TOOL_FUNCTIONS)
