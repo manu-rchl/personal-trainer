@@ -83,7 +83,7 @@ HISTORY_STEP = 10
 
 
 SUMMARY_MAX_CHARS = 3000
-SUMMARY_MAX_TOKENS = 500
+SUMMARY_MAX_TOKENS = 3000  # inkl. evtl. Thinking-Blöcke; der Text selbst wird auf SUMMARY_MAX_CHARS gekappt
 SUMMARY_SYSTEM = (
     "Du fasst ältere Chat-Nachrichten zwischen Manuel und seiner Trainerin Isa zusammen, "
     "damit Isa den Faden behält, wenn sie aus dem Kontext fallen. Behalte: offene Fragen, "

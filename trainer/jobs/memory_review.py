@@ -32,7 +32,9 @@ logger = logging.getLogger(__name__)
 
 PENDING_KEY = "memory_review_pending"
 SYNTHETIC_USER_TURN = "[System: wöchentlicher Memory-Review]"
-MAX_TOKENS = 1500
+# Großzügig: das Modell denkt vor der JSON-Antwort mit (Thinking-Blöcke zählen
+# gegen max_tokens) — mit 1500 kam nur Thinking und kein Text zurück.
+MAX_TOKENS = 8000
 
 SYSTEM_PROMPT = """Du bist die Gedächtnis-Pflege für "Isa", einen persönlichen Fitness-Coach.
 Du bekommst den festen Athleten-Steckbrief, das Profil und ALLE Memories (mit #id).

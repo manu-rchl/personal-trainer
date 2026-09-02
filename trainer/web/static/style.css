@@ -1548,6 +1548,15 @@ a {
   font-size: 11px;
   color: var(--gold);
   margin-top: 2px;
+  margin-right: 8px;
+}
+
+.pr-chip.plateau-chip {
+  color: var(--muted, #9aa0a6);
+}
+
+.pr-chip.target-chip {
+  color: var(--accent);
 }
 
 .filter-bar {

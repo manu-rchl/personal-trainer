@@ -4,9 +4,10 @@ Persönlicher AI-Fitness-Coach für einen Nutzer (Manuel). Ein Telegram-Bot
 ("Isa") mit Tool-Use-Agent, SQLite als einzige Datenbank, tägliche Daten-Syncs
 (Oura Ring, Hevy) und ein lokales Web-Dashboard. Läuft auf dem Mac per launchd.
 
-Stand 2026-09 (Phase 0 abgeschlossen): ein Agent, keine Selbst-Erweiterung,
-kein Apple-Health-Webhook, kein Strong-CSV — siehe `PLAN.md` für die
-Historie und die nächsten Phasen (Coach-Kern, Lernen).
+Stand 2026-09-03 (Phase 0–2 abgeschlossen): ein Agent, der von sich aus
+kommt (Morgen-Check-in, Post-Workout-Auswertung mit Zielgewichten in Hevy,
+Wochenreport, Memory-Pflege) — siehe „Coach-Loop" unten; `PLAN.md` hält die
+Historie.
 
 ## Setup
 
@@ -54,8 +55,8 @@ uv run python -m trainer.ingest.hevy templates     # Übungskatalog cachen
 
 **Gewichts-Konvention:** `workout_sets.weight_kg` ist bei Langhantel das
 Scheibengewicht EINER Seite (reale Last = 20 kg + 2×Wert), bei Kurzhanteln
-das Gewicht pro Hantel. Isa kennt das aus dem Prompt; das Dashboard rechnet
-bis Phase 1 noch mit den Rohwerten.
+das Gewicht pro Hantel. `trainer/analytics.py` rechnet darüber (`load_mode`)
+in effektive Last um — Isa, Dashboard und Jobs nutzen dieselbe Quelle.
 
 ## Isa (Telegram-Bot)
 
@@ -88,21 +89,45 @@ Browser fragt den Token einmal ab und merkt ihn sich (localStorage). Host
 muss `127.0.0.1`/`localhost` sein. Vor einem Umzug auf einen VPS: nur hinter
 Tailscale/WireGuard betreiben.
 
-## Jobs
+## Coach-Loop (Isa kommt von sich aus)
+
+Alles Proaktive läuft als **Agent-Turn** (`trainer/jobs/agent_job.py`): der Job
+schickt Isa eine `[System: …]`-Instruction, Isa nutzt ihre Tools, die Antwort
+geht per Telegram raus und landet als User/Assistant-Paar in der Historie.
+Antwortet Isa exakt `NO_MESSAGE`, wird nichts gesendet.
 
 | Job | Wann | Was |
 |---|---|---|
-| `trainer.ingest.oura sync --days 7` | täglich 10:30 | Oura-Daten |
-| `trainer.ingest.hevy sync` | täglich 23:00 | neueste Hevy-Workouts |
-| `trainer.ingest.hevy sync --full` | So 22:30 | alle Workouts + Delete-Abgleich |
-| `trainer.jobs.reminder_check` | täglich 16:30 | Gym-Reminder, wenn's zum Wochenziel eng wird (synct vorher Hevy) |
-| `trainer.jobs.weekly_report` | So 18:00 | Wochenreport (ein API-Call), Dedupe pro ISO-Woche |
-| `trainer.jobs.health_check` | täglich 09:00 | Sync-Alter, Token-Ablauf, Bot-Heartbeat, Trainingslücke |
+| `jobs.morning_checkin` | 08:00 | Oura-Sync, dann: Readiness/Schlaf, Kalender, was laut Plan dran ist, Essen — max. 5 Zeilen oder Schweigen |
+| `jobs.post_workout` | stündlich 07–23 | Hevy-Sync; pro neuem Workout: jede Übung mit `get_exercise_progress` bewerten, Ziel via `set_exercise_target` setzen (→ Hevy-Notiz), Plateau → ggf. NotebookLM, kurzes Check-in; danach fällige `scheduled_checkins` |
+| `jobs.reminder_check` | 16:30 | Entscheidung deterministisch (`should_remind`), Text von Isa mit Kalender/Reise-Kontext |
+| `jobs.weekly_report` | So 18:00 | Wochenzahlen + Ziel-Tracking, e1RM-Trends, Muskelfrequenz, Reisen; Dedupe pro ISO-Woche |
+| `jobs.memory_review` | So 18:30 | Konsolidierungs-Vorschlag (Duplikate, Widersprüche, Veraltetes, Pins) — Manuel bestätigt mit „ok Memories" |
+| `jobs.health_check` | 09:00 | Sync-Alter, Token-Ablauf, Bot-Heartbeat, Post-Workout-Job, Trainingslücke |
+| `ingest.oura sync` / `ingest.hevy sync` | 10:30 / 23:00 | Daten |
+| `ingest.hevy sync --full` | So 22:30 | alle Workouts + Delete-Abgleich |
 
-Jeder Job läuft in `trainer.jobs.notify.run_job`: bei einer Exception geht
-eine ⚠️-Telegram-Nachricht raus und der Job endet mit Exit 1. Reminder und
-Report werden in `messages` persistiert (mit `[System: …]`-User-Turn), damit
-Isa im Chat weiß, was sie geschickt hat.
+Alle Jobs haben `--dry-run` (Antwort nur ausgeben); `post_workout` zusätzlich
+`--workout-id N` und `--no-hevy-write`. Jeder Job läuft in
+`trainer.jobs.notify.run_job`: Exception → ⚠️-Telegram + Exit 1.
+
+**Coach-Daten** (`trainer/analytics.py` rechnet, Tools in
+`trainer/agent/coach_tools.py`):
+- `exercise_meta.load_mode` — wie `weight_kg` je Übung zu lesen ist
+  (`barbell_per_side` = 20 kg Stange + 2×, `per_hand`, `total`); Heuristik
+  aus Name/Hevy-Equipment, Override per `set_exercise_load_mode`.
+- `training_plan` — aktiver Plan mit Progressions-/Deload-Regel (Seed: PPL,
+  Double Progression 8–12, Deload alle 6–8 Wochen).
+- `exercise_targets` — Ziel fürs nächste Mal pro Übung; wird als oberste
+  Notizzeile in die Hevy-Routine gespiegelt („Ziel (Isa, 03.09.): 25,5 kg ·
+  3×8–12 — …"), damit Manuel es im Training sieht.
+- `get_exercise_progress` — letzte Sessions, e1RM auf effektiver Last,
+  Trend, `plateau` (≥3 Sessions ohne neues e1RM-Hoch), Double-Progression-Hinweis.
+- `scheduled_checkins` — Follow-ups, die Isa sich selbst setzt.
+- `history_summaries` — rollende Zusammenfassung der Chat-Historie, die aus
+  dem Kontextfenster gefallen ist (steht im dynamischen Prompt-Block).
+- `memories.pinned/source` — gepinnte Kernfakten stehen immer im Prompt,
+  Recherche-Wissen trägt seine Quelle.
 
 ## Betrieb
 
@@ -141,4 +166,7 @@ uv run pytest -q
 
 Abgedeckt: Prompt↔Tool-Konsistenz, `query_db`-Authorizer, DB-Migrationen
 (frisch/legacy/idempotent), Telegram-HTML + Chunking, Reminder-Logik,
-Health-Check-Bewertung, Hevy-Routine-Payloads, Obsidian-Schreibpfade.
+Health-Check-Bewertung, Hevy-Routine-Payloads, Obsidian-Schreibpfade,
+Analytics (Load-Modus, e1RM, Plateau, Double Progression, Buckets),
+Coach-Tools (Ziel → DB + Hevy-Notiz, Plan, Follow-ups, Memory-Tools),
+Agent-Jobs (NO_MESSAGE, Fehlertexte, Post-Workout-Dedupe).

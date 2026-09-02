@@ -1229,6 +1229,8 @@ function buildExerciseList(exercises, activeName, onSelect) {
       </div>
       <span class="ex-item-cat">${esc(ex.category || "Sonstige")}</span>
       ${isRecentPr ? `<span class="pr-chip">★ Neuer PR · ${esc(fmtDate(ex.pr_date))}</span>` : ""}
+      ${ex.plateau ? `<span class="pr-chip plateau-chip" title="≥3 Sessions ohne neues e1RM">⏸ Plateau</span>` : ""}
+      ${ex.target_weight_kg != null ? `<span class="pr-chip target-chip" title="Ziel fürs nächste Mal (von Isa)">🎯 ${fmtNum(ex.target_weight_kg, 1)} kg</span>` : ""}
     `;
     item.addEventListener("click", () => onSelect(ex.name));
     wrap.appendChild(item);
@@ -1327,6 +1329,15 @@ function renderProgressGraph(card, progress) {
   const max = Math.max(...weights);
   currentEl.textContent = `${fmtNum(current, 1)} kg`;
   maxEl.textContent = `${fmtNum(max, 1)} kg`;
+  // e1RM rechnet mit der REALEN Last (Stange + beide Seiten bzw. pro Hand);
+  // "Gewicht" zeigt weiterhin den geloggten Wert (Manuels Konvention).
+  const loadNote = {
+    barbell_per_side: "geloggt = Scheiben einer Seite · e1RM auf 20 kg + 2× gerechnet",
+    per_hand: "geloggt = pro Kurzhantel",
+    total: "geloggt = eingestellter Wert",
+  }[progress.load_mode];
+  const titleEl = card.querySelector("#progress-card-title");
+  if (titleEl && loadNote) titleEl.title = loadNote;
 
   const width = 640;
   const height = 200;
