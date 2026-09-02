@@ -22,7 +22,7 @@ import recurring_ical_events
 from icalendar import Calendar
 
 from trainer.config import config
-from trainer.db import get_connection, init_db
+from trainer.db import get_connection
 from trainer.exercise_norm import normalize_name
 from trainer.ingest import hevy as hevy_ingest
 
@@ -56,7 +56,6 @@ def _round(value: Any, ndigits: int = 1) -> Any:
 
 def get_health_summary(days: int = 7) -> dict[str, Any]:
     """Aggregierte Oura-Kennzahlen (Schnitt/Min/Max + Tagesreihe) der letzten `days` Tage."""
-    init_db()
     conn = get_connection()
     try:
         cutoff = _cutoff_date(days)
@@ -125,7 +124,6 @@ def get_workouts(days: int = 14) -> dict[str, Any]:
     `hevy_workout_id` (nur gesetzt bei source='hevy') ist die native Hevy-ID —
     wird von `update_hevy_workout` benötigt, um das Workout live zu bearbeiten.
     """
-    init_db()
     conn = get_connection()
     try:
         cutoff = _cutoff_date(days)
@@ -177,7 +175,6 @@ def log_workout(
     notes: str | None = None,
 ) -> dict[str, Any]:
     """Schreibt ein Workout (source='chat') + zugehörige Sätze."""
-    init_db()
     # Lokale Zeit, nicht UTC — sonst landet ein Workout nach Mitternacht am Vortag.
     workout_date = date or datetime.now().date().isoformat()
 
@@ -232,7 +229,6 @@ def log_meal(
     notes: str | None = None,
 ) -> dict[str, Any]:
     """Speichert eine (i.d.R. per Foto analysierte) Mahlzeit inkl. Makros."""
-    init_db()
     # Lokale Zeit, nicht UTC — Mahlzeiten sollen am Kalendertag von Manuel landen.
     meal_ts = ts or datetime.now().isoformat(timespec="seconds")
 
@@ -261,7 +257,6 @@ def log_meal(
 
 def get_meals(days: int = 7) -> dict[str, Any]:
     """Mahlzeiten der letzten `days` Tage + Tages-Summen (kcal/Protein/Carbs/Fett)."""
-    init_db()
     conn = get_connection()
     try:
         cutoff = _cutoff_date(days)
@@ -313,26 +308,43 @@ def get_meals(days: int = 7) -> dict[str, Any]:
 MAX_QUERY_ROWS = 200
 
 
-def query_db(sql: str) -> dict[str, Any]:
-    """Read-only SQL-Zugriff, nur SELECT erlaubt. Max. 200 Zeilen.
+# Tabellen, die das Modell NIE lesen darf — `secrets` hält OAuth-Tokens,
+# `sync_state` interne Metadaten ohne Trainer-Relevanz.
+_QUERY_DB_HIDDEN_TABLES = frozenset({"secrets", "sync_state"})
 
-    Öffnet die DB über eine echte SQLite-Readonly-URI-Verbindung
-    (file:...?mode=ro), sodass auch versehentliche/böswillige Schreibversuche
-    auf DB-Ebene fehlschlagen — nicht nur durch den String-Check.
+
+def _query_db_authorizer(action: int, arg1: str | None, arg2: str | None, *_: Any) -> int:
+    """SQLite-Authorizer: nur Lesen, und das nicht aus versteckten Tabellen.
+
+    Wird pro Operation beim Prepare aufgerufen; alles außer SELECT/READ/
+    FUNCTION (und den harmlosen Recursive/Transaction-Callbacks) wird
+    abgelehnt. Die zusätzliche `mode=ro`-URI ist der zweite Gürtel.
     """
-    stripped = sql.strip()
-    # Führende SQL-Kommentare entfernen, bevor wir auf SELECT prüfen.
-    lowered = stripped.lstrip()
-    if not lowered.lower().startswith("select"):
+    if action == sqlite3.SQLITE_READ:
+        return sqlite3.SQLITE_DENY if arg1 in _QUERY_DB_HIDDEN_TABLES else sqlite3.SQLITE_OK
+    if action in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_FUNCTION, sqlite3.SQLITE_RECURSIVE):
+        return sqlite3.SQLITE_OK
+    return sqlite3.SQLITE_DENY
+
+
+def query_db(sql: str) -> dict[str, Any]:
+    """Read-only SQL-Zugriff, nur SELECT (auch WITH … SELECT) erlaubt. Max. 200 Zeilen.
+
+    Drei Schichten: (1) Prefix-Check auf SELECT/WITH, (2) Readonly-URI
+    (file:...?mode=ro), (3) SQLite-Authorizer, der jede Nicht-Lese-Operation und
+    jeden Zugriff auf `secrets`/`sync_state` ablehnt.
+    """
+    lowered = sql.strip().lower()
+    if not lowered.startswith(("select", "with")):
         return {
             "error": "Nur SELECT-Statements sind erlaubt.",
             "rejected_sql": sql,
         }
 
-    init_db()  # stellt sicher, dass die Datei existiert, bevor wir read-only öffnen
     uri = f"file:{config.db_path}?mode=ro"
     conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row
+    conn.set_authorizer(_query_db_authorizer)
     try:
         cur = conn.execute(sql)
         rows = cur.fetchmany(MAX_QUERY_ROWS)
@@ -355,7 +367,6 @@ def query_db(sql: str) -> dict[str, Any]:
 
 
 def get_profile() -> dict[str, Any]:
-    init_db()
     conn = get_connection()
     try:
         rows = conn.execute("SELECT key, value FROM profile ORDER BY key").fetchall()
@@ -365,7 +376,6 @@ def get_profile() -> dict[str, Any]:
 
 
 def update_profile(key: str, value: str) -> dict[str, Any]:
-    init_db()
     conn = get_connection()
     try:
         conn.execute(
@@ -390,7 +400,6 @@ MAX_MEMORY_SEARCH_ROWS = 50
 
 def save_memory(content: str, category: str) -> dict[str, Any]:
     """Speichert ein dauerhaft relevantes Fakt über Manuel im Langzeit-Gedächtnis."""
-    init_db()
     ts = datetime.now(timezone.utc).isoformat()
     conn = get_connection()
     try:
@@ -415,7 +424,6 @@ def search_memories(query: str | None = None, category: str | None = None) -> di
 
     Ohne `query`: alle Memories (ggf. nach Kategorie gefiltert), max. 50, neueste zuerst.
     """
-    init_db()
     conn = get_connection()
     try:
         sql = "SELECT id, ts, category, content FROM memories WHERE 1=1"
@@ -836,7 +844,6 @@ def merge_exercises(from_name: str, into_name: str) -> dict[str, Any]:
     Überschreibt einen bestehenden Eintrag für denselben (normalisierten)
     `from_name`, falls vorhanden.
     """
-    init_db()
     alias = normalize_name(from_name)
     conn = get_connection()
     try:
@@ -894,7 +901,6 @@ def search_hevy_exercises(query: str) -> dict[str, Any]:
     Kleinschreibung und Satzzeichen keine Rolle spielen. Liefert max. 15
     Treffer ({id, title, primary_muscle}).
     """
-    init_db()
     conn = get_connection()
     try:
         rows = conn.execute(
@@ -1095,7 +1101,6 @@ def create_hevy_routine(title: str, exercises: list[dict[str, Any]]) -> dict[str
     if not config.hevy_api_key:
         return {"error": "Hevy ist nicht konfiguriert (HEVY_API_KEY fehlt)."}
 
-    init_db()
     conn = get_connection()
     try:
         template_count = conn.execute(
@@ -1189,7 +1194,6 @@ def update_hevy_routine(
     matched: list[dict[str, Any]] = []
     unmatched: list[str] = []
     if exercises is not None:
-        init_db()
         conn = get_connection()
         try:
             payload_exercises, matched, unmatched = _match_hevy_exercises(
@@ -1276,7 +1280,6 @@ def update_hevy_workout(
     matched: list[dict[str, Any]] = []
     unmatched: list[str] = []
     if exercises is not None:
-        init_db()
         conn = get_connection()
         try:
             payload_exercises, matched, unmatched = _match_hevy_exercises(

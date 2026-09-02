@@ -9,12 +9,15 @@ Auth-Flow:
     2. Browser öffnet https://cloud.ouraring.com/oauth/authorize
     3. Nutzer bestätigt, Oura redirected mit ?code=... zurück
     4. Code wird gegen access_token/refresh_token getauscht (POST /oauth/token)
-    5. Tokens landen in sync_state (Keys: oura_access_token, oura_refresh_token,
-       oura_token_expires_at)
+    5. Tokens landen in der Tabelle `secrets` (Keys: oura_access_token,
+       oura_refresh_token, oura_token_expires_at) — NICHT in sync_state, damit
+       query_db sie dem Modell nie zeigt.
 
 WICHTIG: Oura-Refresh-Tokens sind SINGLE-USE. Bei jedem Refresh liefert die API
-einen neuen refresh_token zurück — dieser wird SOFORT persistiert, bevor der
-Rest der Response weiterverarbeitet wird (siehe refresh_access_token()).
+einen neuen refresh_token zurück — dieser wird SOFORT und in EINER Transaktion
+persistiert, bevor der Rest der Response weiterverarbeitet wird (siehe
+refresh_access_token()). Schlägt der Refresh fehl (Token von Oura invalidiert),
+geht eine Telegram-Nachricht raus, statt still im Log zu sterben.
 """
 
 from __future__ import annotations
@@ -53,7 +56,7 @@ SK_EXPIRES_AT = "oura_token_expires_at"
 
 
 # --------------------------------------------------------------------------
-# sync_state Helfer
+# sync_state / secrets Helfer
 # --------------------------------------------------------------------------
 
 
@@ -66,26 +69,35 @@ def _set_state(conn: sqlite3.Connection, key: str, value: str) -> None:
     conn.commit()
 
 
-def _get_state(conn: sqlite3.Connection, key: str) -> str | None:
-    row = conn.execute("SELECT value FROM sync_state WHERE key = ?", (key,)).fetchone()
+def _get_secret(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM secrets WHERE key = ?", (key,)).fetchone()
     return row["value"] if row else None
 
 
 def _save_tokens(conn: sqlite3.Connection, token_response: dict[str, Any]) -> None:
-    """Persistiert access_token, refresh_token und expiry SOFORT.
+    """Persistiert access_token, refresh_token und expiry SOFORT — atomar.
 
     Muss aufgerufen werden, bevor der Aufrufer irgendetwas anderes mit der
     Response macht — Oura-Refresh-Tokens sind single-use, ein Absturz danach
-    darf den neuen Token nicht verlieren.
+    darf den neuen Token nicht verlieren. Alle drei Keys in EINER Transaktion,
+    sonst könnte ein Crash mittendrin neuen Access- mit altem Refresh-Token
+    kombinieren.
     """
     access_token = token_response["access_token"]
     refresh_token = token_response["refresh_token"]
     expires_in = int(token_response.get("expires_in", 86400))
     expires_at = time.time() + expires_in
 
-    _set_state(conn, SK_ACCESS_TOKEN, access_token)
-    _set_state(conn, SK_REFRESH_TOKEN, refresh_token)
-    _set_state(conn, SK_EXPIRES_AT, str(expires_at))
+    conn.executemany(
+        "INSERT INTO secrets (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [
+            (SK_ACCESS_TOKEN, access_token),
+            (SK_REFRESH_TOKEN, refresh_token),
+            (SK_EXPIRES_AT, str(expires_at)),
+        ],
+    )
+    conn.commit()
 
 
 # --------------------------------------------------------------------------
@@ -187,14 +199,13 @@ def auth() -> None:
     resp.raise_for_status()
     token_response = resp.json()
 
-    init_db()
     conn = get_connection()
     try:
         _save_tokens(conn, token_response)
     finally:
         conn.close()
 
-    print("Oura-Autorisierung abgeschlossen. Tokens in sync_state gespeichert.")
+    print("Oura-Autorisierung abgeschlossen. Tokens in `secrets` gespeichert.")
 
 
 # --------------------------------------------------------------------------
@@ -202,17 +213,23 @@ def auth() -> None:
 # --------------------------------------------------------------------------
 
 
+REAUTH_HINT = "Bitte `uv run python -m trainer.ingest.oura auth` ausführen."
+
+
+class OuraAuthExpired(RuntimeError):
+    """Refresh-Token ungültig/abgelaufen — nur ein neuer `auth`-Lauf hilft."""
+
+
 def refresh_access_token(conn: sqlite3.Connection) -> str:
     """Tauscht den aktuellen (single-use) refresh_token gegen ein neues Paar.
 
     Persistiert das Ergebnis SOFORT (siehe _save_tokens), bevor der neue
-    access_token an den Aufrufer zurückgegeben wird.
+    access_token an den Aufrufer zurückgegeben wird. Ein 400/401 von Oura
+    heißt: Refresh-Token ist verbraucht oder widerrufen → OuraAuthExpired.
     """
-    refresh_token = _get_state(conn, SK_REFRESH_TOKEN)
+    refresh_token = _get_secret(conn, SK_REFRESH_TOKEN)
     if not refresh_token:
-        raise RuntimeError(
-            "Kein Oura-Refresh-Token vorhanden. Erst 'python -m trainer.ingest.oura auth' ausführen."
-        )
+        raise OuraAuthExpired(f"Kein Oura-Refresh-Token vorhanden. {REAUTH_HINT}")
 
     resp = httpx.post(
         TOKEN_URL,
@@ -224,6 +241,10 @@ def refresh_access_token(conn: sqlite3.Connection) -> str:
         },
         timeout=30,
     )
+    if resp.status_code in (400, 401):
+        raise OuraAuthExpired(
+            f"Oura-Token-Refresh abgelehnt (HTTP {resp.status_code}). {REAUTH_HINT}"
+        )
     resp.raise_for_status()
     token_response = resp.json()
 
@@ -234,13 +255,11 @@ def refresh_access_token(conn: sqlite3.Connection) -> str:
 
 
 def ensure_access_token(conn: sqlite3.Connection) -> str:
-    access_token = _get_state(conn, SK_ACCESS_TOKEN)
-    expires_at_raw = _get_state(conn, SK_EXPIRES_AT)
+    access_token = _get_secret(conn, SK_ACCESS_TOKEN)
+    expires_at_raw = _get_secret(conn, SK_EXPIRES_AT)
 
     if not access_token:
-        raise RuntimeError(
-            "Kein Oura-Access-Token vorhanden. Erst 'python -m trainer.ingest.oura auth' ausführen."
-        )
+        raise OuraAuthExpired(f"Kein Oura-Access-Token vorhanden. {REAUTH_HINT}")
 
     expires_at = float(expires_at_raw) if expires_at_raw else 0.0
     if time.time() >= expires_at - 60:  # kleiner Sicherheitspuffer
@@ -358,7 +377,11 @@ def upsert_oura_daily(conn: sqlite3.Connection, kind: str, record: dict) -> None
 
 
 def sync(days: int = 7) -> None:
-    init_db()
+    """Holt die letzten `days` Tage aller ENDPOINTS und upsertet sie.
+
+    Wirft OuraAuthExpired, wenn die Tokens nicht mehr zu retten sind — der
+    Aufrufer (main → run_job) macht daraus eine Telegram-Nachricht.
+    """
     conn = get_connection()
     try:
         access_token = ensure_access_token(conn)
@@ -370,25 +393,22 @@ def sync(days: int = 7) -> None:
 
         headers = {"Authorization": f"Bearer {access_token}"}
         total = 0
+        refreshed = False  # höchstens EIN Refresh pro Lauf (Refresh-Tokens sind single-use)
 
         with httpx.Client(headers=headers, timeout=30) as client:
             for kind, endpoint in ENDPOINTS.items():
                 try:
                     records = _fetch_all(client, endpoint, start_date, end_date)
                 except _Unauthorized:
-                    # Einmaliger Refresh-Versuch bei 401, danach Abbruch.
+                    if refreshed:
+                        raise OuraAuthExpired(
+                            f"Weiterhin 401 nach Token-Refresh. {REAUTH_HINT}"
+                        )
                     print("401 erhalten, versuche Token-Refresh...")
                     access_token = refresh_access_token(conn)
+                    refreshed = True
                     client.headers["Authorization"] = f"Bearer {access_token}"
-                    try:
-                        records = _fetch_all(client, endpoint, start_date, end_date)
-                    except _Unauthorized:
-                        print(
-                            "FEHLER: weiterhin 401 nach Token-Refresh. "
-                            "Bitte 'python -m trainer.ingest.oura auth' erneut ausführen.",
-                            file=sys.stderr,
-                        )
-                        sys.exit(1)
+                    records = _fetch_all(client, endpoint, start_date, end_date)
 
                 for record in records:
                     upsert_oura_daily(conn, kind, record)
@@ -420,6 +440,7 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+    init_db()
 
     if args.command == "auth":
         auth()

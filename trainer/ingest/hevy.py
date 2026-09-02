@@ -185,7 +185,6 @@ def sync(full: bool = False) -> dict[str, Any]:
     für den Alltags-Sync). full=True: alle Seiten (Backfill/Migration).
     """
     _require_api_key()
-    init_db()
     conn = get_connection()
     try:
         inserted = 0
@@ -241,7 +240,6 @@ def sync(full: bool = False) -> dict[str, Any]:
 def cache_templates() -> int:
     """Holt alle Hevy-Exercise-Templates paginiert und cached sie in der DB."""
     _require_api_key()
-    init_db()
     conn = get_connection()
     try:
         count = 0
@@ -308,6 +306,7 @@ def main() -> None:
     sub.add_parser("templates", help="Exercise-Templates cachen")
 
     args = parser.parse_args()
+    init_db()
 
     if args.command == "sync":
         result = sync(full=args.full)

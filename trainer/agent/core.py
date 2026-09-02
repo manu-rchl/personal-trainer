@@ -29,7 +29,7 @@ from trainer.agents import (
     get_agent,
 )
 from trainer.config import config
-from trainer.db import get_connection, init_db
+from trainer.db import get_connection
 
 logger = logging.getLogger(__name__)
 
@@ -205,7 +205,6 @@ def run_agent(
     Platzhalter ("[Foto gesendet]"), damit die geladene Historie immer aus
     reinen Strings besteht.
     """
-    init_db()
 
     agent_def = get_agent(agent)
     tool_schemas = [s for s in TOOL_SCHEMAS if s["name"] in agent_def.tool_names]

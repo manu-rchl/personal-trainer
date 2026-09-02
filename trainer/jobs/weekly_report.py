@@ -259,7 +259,6 @@ def _persist_message(text: str) -> None:
 
 def run(reference: date | None = None) -> None:
     """Aggregiert, formuliert und verschickt den Wochenreport für die Woche um `reference`."""
-    init_db()
     today = reference or date.today()
     monday, sunday = week_bounds(today)
     prev_start, prev_end = previous_period_bounds(monday)
@@ -285,4 +284,5 @@ def run(reference: date | None = None) -> None:
 
 
 if __name__ == "__main__":
+    init_db()
     run()

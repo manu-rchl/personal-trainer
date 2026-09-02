@@ -81,7 +81,6 @@ def build_reminder_text(done: int, goal: int, remaining: int, days: int, weekday
 
 
 def run(today: date | None = None) -> None:
-    init_db()
     today = today or date.today()
     today_iso = today.isoformat()
 
@@ -140,4 +139,5 @@ def run(today: date | None = None) -> None:
 
 
 if __name__ == "__main__":
+    init_db()
     run()

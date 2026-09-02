@@ -112,7 +112,6 @@ def test_create_hevy_routine_parses_real_response_shape(monkeypatch):
     """Live gegen die echte Hevy-API beobachtete 201-Response:
     {"routine": [{"id": "...", ...}]} — `routine` als Liste, nicht als Objekt.
     """
-    monkeypatch.setattr(tools_module, "init_db", lambda: None)
     monkeypatch.setattr(tools_module, "get_connection", lambda: _conn_with_templates())
     if not tools_module.config.hevy_api_key:
         pytest.skip("HEVY_API_KEY nicht gesetzt — Config ist frozen, kann in Tests nicht gepatcht werden")
@@ -245,7 +244,6 @@ def test_update_hevy_workout_replaces_exercises_when_given(monkeypatch):
             "exercises": [],
         }
     )
-    monkeypatch.setattr(tools_module, "init_db", lambda: None)
     monkeypatch.setattr(tools_module, "get_connection", lambda: _conn_with_templates())
     monkeypatch.setattr(tools_module.httpx, "get", lambda *a, **kw: get_response)
 

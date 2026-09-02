@@ -33,6 +33,10 @@ from trainer.exercise_norm import canonicalize
 
 app = FastAPI(title="Agent Hub")
 
+# Prozess-Einstiegspunkt: Schema + Migrationen einmal beim Import (uvicorn
+# importiert das Modul genau einmal pro Worker), nicht pro Request.
+init_db()
+
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
@@ -75,7 +79,6 @@ def chat_history(agent: str, limit: int = 50) -> list[dict[str, Any]]:
     if agent not in AGENTS:
         raise HTTPException(status_code=404, detail=f"Unbekannter Agent: {agent}")
 
-    init_db()
     conn = get_connection()
     try:
         rows = conn.execute(
@@ -128,7 +131,6 @@ def health_overview(days: int = 30) -> dict[str, Any]:
     - today: neuester Tag MIT Health-Daten (nicht zwingend der Kalendertag, falls
       der Oura-Sync für heute noch nicht gelaufen ist).
     """
-    init_db()
     conn = get_connection()
     try:
         today = date.today()
@@ -282,7 +284,6 @@ def overview() -> dict[str, Any]:
     except Exception:
         last_workouts = []
 
-    init_db()
     conn = get_connection()
     try:
         today_iso = date.today().isoformat()
@@ -403,7 +404,6 @@ def workouts(
         filtered = [w for w in filtered if (w.get("type") or "").strip() in wanted]
 
     if exercise:
-        init_db()
         conn = get_connection()
         try:
             name_rows = conn.execute(
@@ -540,7 +540,6 @@ def list_exercises() -> list[dict[str, Any]]:
     dominanter Trainings-Kategorie (workouts.type), sortiert nach Häufigkeit
     (sessions DESC). Namensvarianten (Strong vs. Hevy) fallen dank `canonicalize`
     zu einer Zeile zusammen."""
-    init_db()
     conn = get_connection()
     try:
         grouped, categories = _grouped_exercise_points(conn)
@@ -583,7 +582,6 @@ def exercise_progress(name: str) -> dict[str, Any]:
     """Gewichts-Verlauf einer kanonischen Übung: pro Workout-Datum der schwerste Satz
     inkl. Satzzahl (chronologisch), Varianten via `canonicalize` gemergt. Leere Liste
     bei unbekannter Übung."""
-    init_db()
     conn = get_connection()
     try:
         grouped, _categories = _grouped_exercise_points(conn)
@@ -598,7 +596,6 @@ def training_volume(weeks: int = 12) -> dict[str, Any]:
     """Trainingsvolumen (Summe weight_kg × reps) pro Kalenderwoche (Montag-Start),
     auch leere Wochen mit 0 — gleiches Zero-Fill-Pattern wie `workouts_per_week`
     in `health_overview`, nur über `workout_sets` statt `workouts` aggregiert."""
-    init_db()
     conn = get_connection()
     try:
         today = date.today()
