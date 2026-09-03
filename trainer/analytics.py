@@ -462,6 +462,67 @@ def exercise_progress(conn: sqlite3.Connection, exercise: str, sessions: int = 8
 
 
 # ---------------------------------------------------------------------------
+# Körpergewicht
+# ---------------------------------------------------------------------------
+
+
+def weight_trend(
+    conn: sqlite3.Connection,
+    weeks: int = 8,
+    goal_kg: float | None = None,
+    deadline: date | None = None,
+    today: date | None = None,
+) -> dict[str, Any]:
+    """Wochenschnitte, Veränderung, Tempo — und ob das Ziel bis zur Deadline erreichbar ist."""
+    today = today or date.today()
+    buckets = week_buckets(weeks, today)
+    rows = conn.execute(
+        "SELECT date, weight_kg FROM body_weight WHERE date >= ? ORDER BY date",
+        (buckets[0].isoformat(),),
+    ).fetchall()
+    per_week: dict[str, list[float]] = {b.isoformat(): [] for b in buckets}
+    for r in rows:
+        d = _parse_date(r["date"])
+        if d is None:
+            continue
+        key = week_start(d).isoformat()
+        if key in per_week:
+            per_week[key].append(float(r["weight_kg"]))
+    weekly = [
+        {"week": k, "avg_kg": _round(sum(v) / len(v), 2) if v else None, "n": len(v)}
+        for k, v in per_week.items()
+    ]
+    with_data = [w for w in weekly if w["avg_kg"] is not None]
+    latest_row = conn.execute("SELECT date, weight_kg FROM body_weight ORDER BY date DESC LIMIT 1").fetchone()
+    latest = {"date": latest_row["date"], "weight_kg": latest_row["weight_kg"]} if latest_row else None
+    result: dict[str, Any] = {
+        "weeks": weeks,
+        "weekly": weekly,
+        "latest": latest,
+        "entries": len(rows),
+        "days_since_last": (today - _parse_date(latest_row["date"])).days if latest_row else None,
+        "change_kg": None,
+        "pace_kg_per_week": None,
+        "goal_kg": goal_kg,
+        "deadline": deadline.isoformat() if deadline else None,
+        "needed_kg_per_week": None,
+        "on_track": None,
+    }
+    if len(with_data) >= 2:
+        first, last = with_data[0], with_data[-1]
+        span_weeks = max(1, (date.fromisoformat(last["week"]) - date.fromisoformat(first["week"])).days // 7)
+        result["change_kg"] = _round(last["avg_kg"] - first["avg_kg"], 2)
+        result["pace_kg_per_week"] = _round((last["avg_kg"] - first["avg_kg"]) / span_weeks, 3)
+    if goal_kg is not None and deadline is not None and latest:
+        weeks_left = max(0.1, (deadline - today).days / 7)
+        needed = (goal_kg - float(latest["weight_kg"])) / weeks_left
+        result["needed_kg_per_week"] = _round(needed, 3)
+        if result["pace_kg_per_week"] is not None:
+            result["on_track"] = result["pace_kg_per_week"] >= needed * 0.8 if needed > 0 else True
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Wochen-Aggregate
 # ---------------------------------------------------------------------------
 

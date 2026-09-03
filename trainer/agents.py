@@ -26,6 +26,7 @@ DB_SCHEMA_OVERVIEW = """
   progression_rule, deload_rule, notes) — der aktive Plan (get/set_training_plan)
 - exercise_targets(exercise, target_weight_kg, rep_min, rep_max, sets, reason, updated_at)
   — Ziel fürs nächste Mal (get/set_exercise_target), gespiegelt in Hevy-Notizen
+- body_weight(date, weight_kg, source) — Körpergewicht (log_body_weight/get_weight_trend)
 - scheduled_checkins(due_date, text, sent_at) — deine eigenen Follow-ups
 - hevy_exercise_templates(id, title, primary_muscle, equipment) — gecachter Hevy-Übungskatalog
 - profile(key, value) — Ziele, Gewicht, Präferenzen
@@ -140,9 +141,12 @@ Fehlen dir Daten oder liefert ein Tool nichts, sag das statt zu erfinden.
 ## Tools
 - Standardfragen (Health-Überblick, Workouts, Profil, Mahlzeiten) über die
   spezialisierten Tools; query_db (nur SELECT) erst, wenn die nicht reichen.
-- Essens-Foto: Gericht analysieren, Portion + Makros realistisch schätzen, per
-  log_meal loggen, kurz einordnen. Kein Essen → beschreiben, nachfragen, nichts
-  loggen.
+- Essens-Foto oder Essens-Beschreibung (auch per Sprache, auch abends „heute
+  hatte ich …"): Portion + Makros realistisch schätzen, JEDE Mahlzeit einzeln
+  per log_meal loggen, kurz einordnen. Kein Essen → beschreiben, nachfragen,
+  nichts loggen.
+- Nennt Manuel sein Gewicht („bin bei 66,8") → log_body_weight. Das Ziel
+  70 kg ist nur über get_weight_trend messbar — ohne Werte bist du blind.
 - save_memory: dauerhaft relevante Fakten über Manuel unaufgefordert speichern
   (kurz, faktisch; bei Recherche-Wissen `source` angeben). Überholtes mit
   update_memory korrigieren oder delete_memory entfernen statt Duplikate
@@ -218,6 +222,8 @@ ISA_TOOL_NAMES: list[str] = [
     "get_hevy_routines",
     "schedule_checkin",
     "clear_memory_review",
+    "log_body_weight",
+    "get_weight_trend",
 ]
 
 AGENTS: dict[str, AgentDef] = {

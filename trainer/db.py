@@ -145,6 +145,15 @@ CREATE TABLE IF NOT EXISTS exercise_targets (
     updated_at TEXT
 );
 
+-- Körpergewicht (lokale Wahrheit; Hevy-Body-Measurements werden best-effort
+-- mitgeschrieben). Ein Wert pro Tag.
+CREATE TABLE IF NOT EXISTS body_weight (
+    date TEXT PRIMARY KEY,
+    weight_kg REAL NOT NULL,
+    source TEXT,
+    ts TEXT
+);
+
 -- Follow-ups, die Isa sich selbst setzt ("Legs in Düsseldorf?"); der
 -- Post-Workout-Job schickt fällige als Agent-Turn raus.
 CREATE TABLE IF NOT EXISTS scheduled_checkins (

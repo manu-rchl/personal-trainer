@@ -1119,6 +1119,30 @@ async function renderHealth(panel) {
     grid.appendChild(tile);
   });
 
+  // Körpergewicht (Ziel 70 kg) — eigene Karte, Daten aus /api/weight.
+  try {
+    const w = await fetchJson("/api/weight?weeks=12");
+    if (state.route !== "#/health") return;
+    const values = w.weekly.map((x) => x.avg_kg);
+    const latest = w.latest ? w.latest.weight_kg : null;
+    const tile = metricCard("Körpergewicht", values, latest, "kg", 1);
+    tile.classList.add("card-third");
+    const cmp = tile.querySelector(".cmp");
+    if (cmp) {
+      if (!w.latest) {
+        cmp.textContent = "Noch kein Wert — sag Isa dein Gewicht.";
+      } else {
+        const parts = [`zuletzt ${esc(fmtDate(w.latest.date))}`];
+        if (w.pace_kg_per_week != null) parts.push(`${w.pace_kg_per_week >= 0 ? "+" : ""}${fmtNum(w.pace_kg_per_week, 2)} kg/Wo`);
+        if (w.goal_kg != null) parts.push(`Ziel ${fmtNum(w.goal_kg, 0)} kg${w.on_track === false ? " · hinter Plan" : w.on_track ? " · auf Kurs" : ""}`);
+        cmp.textContent = parts.join(" · ");
+      }
+    }
+    grid.appendChild(tile);
+  } catch {
+    /* Gewichts-Karte ist optional */
+  }
+
   const sleepDurationTile = metricCard(
     "Schlafdauer",
     daily.map((d) => d.sleep_duration_min),

@@ -101,6 +101,7 @@ Antwortet Isa exakt `NO_MESSAGE`, wird nichts gesendet.
 | `jobs.morning_checkin` | 08:00 | Oura-Sync, dann: Readiness/Schlaf, Kalender, was laut Plan dran ist, Essen — max. 5 Zeilen oder Schweigen |
 | `jobs.post_workout` | stündlich 07–23 | Hevy-Sync; pro neuem Workout: jede Übung mit `get_exercise_progress` bewerten, Ziel via `set_exercise_target` setzen (→ Hevy-Notiz), Plateau → ggf. NotebookLM, kurzes Check-in; danach fällige `scheduled_checkins` |
 | `jobs.reminder_check` | 16:30 | Entscheidung deterministisch (`should_remind`), Text von Isa mit Kalender/Reise-Kontext |
+| `jobs.evening_nutrition` | 20:30 | Heute geloggte Mahlzeiten vs. Ziel → fragt „Was hast du gegessen?" (Foto/Sprache/Text), sonst Schweigen |
 | `jobs.weekly_report` | So 18:00 | Wochenzahlen + Ziel-Tracking, e1RM-Trends, Muskelfrequenz, Reisen; Dedupe pro ISO-Woche |
 | `jobs.memory_review` | So 18:30 | Konsolidierungs-Vorschlag (Duplikate, Widersprüche, Veraltetes, Pins) — Manuel bestätigt mit „ok Memories" |
 | `jobs.health_check` | 09:00 | Sync-Alter, Token-Ablauf, Bot-Heartbeat, Post-Workout-Job, Trainingslücke |
@@ -124,6 +125,10 @@ Alle Jobs haben `--dry-run` (Antwort nur ausgeben); `post_workout` zusätzlich
 - `get_exercise_progress` — letzte Sessions, e1RM auf effektiver Last,
   Trend, `plateau` (≥3 Sessions ohne neues e1RM-Hoch), Double-Progression-Hinweis.
 - `scheduled_checkins` — Follow-ups, die Isa sich selbst setzt.
+- `body_weight` — Körpergewicht (`log_body_weight`, spiegelt nach Hevy);
+  `get_weight_trend` liefert Wochenschnitte, Tempo und `needed_kg_per_week`
+  bis zur Deadline. Morgen-Check bittet um einen Wert, wenn der letzte älter
+  als 7 Tage ist; Health-View zeigt die Karte.
 - `history_summaries` — rollende Zusammenfassung der Chat-Historie, die aus
   dem Kontextfenster gefallen ist (steht im dynamischen Prompt-Block).
 - `memories.pinned/source` — gepinnte Kernfakten stehen immer im Prompt,

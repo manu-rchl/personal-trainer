@@ -496,6 +496,27 @@ def exercise_progress(name: str) -> dict[str, Any]:
     }
 
 
+@app.get("/api/weight")
+def weight(weeks: int = 12) -> dict[str, Any]:
+    """Körpergewicht: Rohwerte + Wochenschnitte + Ziel-Abgleich (aus profile)."""
+    conn = get_connection()
+    try:
+        profile = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM profile")}
+        goal = float(profile["goal_weight_kg"]) if profile.get("goal_weight_kg") else None
+        deadline = date.fromisoformat(profile["goal_deadline"]) if profile.get("goal_deadline") else None
+        trend = analytics.weight_trend(conn, weeks=weeks, goal_kg=goal, deadline=deadline)
+        cutoff = analytics.week_buckets(weeks)[0].isoformat()
+        entries = [
+            {"date": r["date"], "weight_kg": r["weight_kg"]}
+            for r in conn.execute(
+                "SELECT date, weight_kg FROM body_weight WHERE date >= ? ORDER BY date", (cutoff,)
+            )
+        ]
+    finally:
+        conn.close()
+    return {**trend, "entries": entries}
+
+
 @app.get("/api/training/volume")
 def training_volume(weeks: int = 12) -> dict[str, Any]:
     """Effektives Trainingsvolumen pro Kalenderwoche (Montag-Start), Zero-Fill."""

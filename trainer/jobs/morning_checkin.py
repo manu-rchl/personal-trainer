@@ -25,7 +25,8 @@ MORNING_INSTRUCTION = """[System: Morgen-Check-in {today}, {weekday}] Schau kurz
 - get_calendar(days=1): Termine/Reisen heute.
 - get_training_plan + get_workouts(days=7) + get_muscle_frequency(weeks=2): was ist heute dran (welcher Tag des Splits, Erholung seit letztem Training, Wochenziel)?
 - Ernährung: er isst chronisch zu wenig und will besonders morgens erinnert werden — aber nicht jeden Tag gleich.
-Schreib dann max. 5 Zeilen an Manuel: die eine wichtigste Sache für heute (Training ja/nein/wie hart, oder Essen, oder Recovery), konkret und persönlich. Kein Standard-Guten-Morgen. Wenn es heute wirklich nichts zu sagen gibt (Ruhetag, normale Werte, nichts offen), antworte NO_MESSAGE."""
+- get_weight_trend: Ist der letzte Gewichtswert älter als 7 Tage (oder gibt es keinen), bitte ihn heute morgen nüchtern auf die Waage — ein Satz reicht, er antwortet dir dann mit der Zahl. Sonst nicht erwähnen.
+Schreib dann max. 5 Zeilen an Manuel: die eine wichtigste Sache für heute (Training ja/nein/wie hart, oder Essen, oder Recovery), konkret und persönlich. Kein Standard-Guten-Morgen. Wenn es heute wirklich nichts zu sagen gibt (Ruhetag, normale Werte, nichts offen, Gewicht aktuell), antworte NO_MESSAGE."""
 
 WEEKDAYS = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
 

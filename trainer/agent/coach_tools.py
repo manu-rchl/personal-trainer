@@ -335,6 +335,59 @@ def schedule_checkin(due_date: str, text: str) -> dict[str, Any]:
         conn.close()
 
 
+# ---------------------------------------------------------------------------
+# Körpergewicht
+# ---------------------------------------------------------------------------
+
+
+def log_body_weight(weight_kg: float, day: str | None = None, mirror_to_hevy: bool = True) -> dict[str, Any]:
+    """Speichert das Körpergewicht (ein Wert pro Tag, überschreibt) und schreibt es
+    best-effort auch als Hevy-Body-Measurement."""
+    try:
+        w = float(weight_kg)
+    except (TypeError, ValueError):
+        return {"error": "weight_kg muss eine Zahl sein."}
+    if not 30 <= w <= 200:
+        return {"error": f"{w} kg wirkt unplausibel — bitte prüfen."}
+    d = date.today() if not day else date.fromisoformat(day)
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO body_weight (date, weight_kg, source, ts) VALUES (?, ?, 'chat', ?) "
+            "ON CONFLICT(date) DO UPDATE SET weight_kg = excluded.weight_kg, ts = excluded.ts",
+            (d.isoformat(), w, datetime.now(timezone.utc).isoformat()),
+        )
+        conn.execute(
+            "INSERT INTO profile (key, value) VALUES ('current_weight_kg', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (f"{w:g}",),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    result: dict[str, Any] = {"status": "gespeichert", "date": d.isoformat(), "weight_kg": w}
+    if mirror_to_hevy and config.hevy_api_key and HEVY_WRITE_ENABLED:
+        from trainer.agent.tools import log_body_measurement, update_body_measurement
+
+        r = log_body_measurement(d.isoformat(), weight_kg=w)
+        if "error" in r and "existiert bereits" in r["error"]:
+            r = update_body_measurement(d.isoformat(), weight_kg=w)
+        result["hevy"] = r
+    return result
+
+
+def get_weight_trend(weeks: int = 8) -> dict[str, Any]:
+    """Wochenschnitte des Körpergewichts, Tempo und Abgleich mit Ziel/Deadline aus dem Profil."""
+    conn = get_connection()
+    try:
+        profile = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM profile")}
+        goal = float(profile["goal_weight_kg"]) if profile.get("goal_weight_kg") else None
+        deadline = date.fromisoformat(profile["goal_deadline"]) if profile.get("goal_deadline") else None
+        return analytics.weight_trend(conn, weeks=max(2, min(weeks, 52)), goal_kg=goal, deadline=deadline)
+    finally:
+        conn.close()
+
+
 def clear_memory_review() -> dict[str, Any]:
     """Markiert den offenen Memory-Review-Vorschlag als erledigt (nach Anwenden/Ablehnen)."""
     conn = get_connection()
@@ -347,6 +400,32 @@ def clear_memory_review() -> dict[str, Any]:
 
 
 COACH_TOOL_SCHEMAS: list[dict[str, Any]] = [
+    {
+        "name": "log_body_weight",
+        "description": (
+            "Speichert Manuels Körpergewicht (kg) für einen Tag — immer aufrufen, wenn er sein "
+            "Gewicht nennt. Aktualisiert profile.current_weight_kg und Hevy-Body-Measurements."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "weight_kg": {"type": "number"},
+                "day": {"type": "string", "description": "YYYY-MM-DD, Default heute."},
+            },
+            "required": ["weight_kg"],
+        },
+    },
+    {
+        "name": "get_weight_trend",
+        "description": (
+            "Körpergewicht: Wochenschnitte, Veränderung, Tempo (kg/Woche) und ob das Ziel bis zur "
+            "Deadline erreichbar ist (needed_kg_per_week, on_track). days_since_last sagt, wie alt der letzte Wert ist."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"weeks": {"type": "integer", "description": "Zeitraum, Default 8."}},
+        },
+    },
     {
         "name": "clear_memory_review",
         "description": "Schließt den offenen Memory-Review-Vorschlag ab, nachdem du ihn angewendet oder Manuel ihn abgelehnt hat.",
@@ -467,6 +546,8 @@ COACH_TOOL_SCHEMAS: list[dict[str, Any]] = [
 ]
 
 COACH_TOOL_FUNCTIONS: dict[str, Any] = {
+    "log_body_weight": log_body_weight,
+    "get_weight_trend": get_weight_trend,
     "clear_memory_review": clear_memory_review,
     "get_exercise_progress": get_exercise_progress,
     "get_muscle_frequency": get_muscle_frequency,

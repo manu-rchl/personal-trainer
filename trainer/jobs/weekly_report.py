@@ -223,7 +223,7 @@ REPORT_INSTRUCTION = """[System: Wochenreport {week_key}] Hier die deterministis
 
 Bau daraus Manuels Wochenreport (Telegram-Stil, max. ~20 Zeilen):
 1. Wochenüberblick: Schlaf, Recovery, Aktivität, Training, Ernährung — mit Bezug auf die Vorwochen (Ups & Downs klar benennen).
-2. Ziel-Tracking: Gewicht Richtung 70 kg (get_profile, ggf. Body-Measurements/Memories), Protein-/Kalorienziel vs. geloggt, Trainingstage vs. Plan (get_training_plan).
+2. Ziel-Tracking: Körpergewicht via get_weight_trend (Tempo vs. needed_kg_per_week, on_track; fehlen Werte, sag das und bitte um einen), Protein-/Kalorienziel vs. geloggt (get_meals 7), Trainingstage vs. Plan (get_training_plan).
 3. Kraft: rufe get_exercise_progress für die 3 wichtigsten Übungen der Woche auf (aus get_workouts(days=7)) und nenne e1RM-Trend/Plateaus; get_muscle_frequency(weeks=4) für den Frequenz-Check.
 4. Kontext: get_calendar(days=7) — Reisen/Termine nächste Woche berücksichtigen, statt pauschal mehr Training zu fordern.
 5. 1–2 konkrete Änderungen für nächste Woche, die in seinen Alltag passen.

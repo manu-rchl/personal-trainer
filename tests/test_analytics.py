@@ -144,3 +144,21 @@ def test_set_load_mode_override(conn):
     assert a.exercise_progress(conn, "Kitten")["load_mode"] == "per_hand"
     with pytest.raises(ValueError):
         a.set_load_mode(conn, "Kitten", "nonsense")
+
+
+def test_weight_trend_pace_and_goal(conn):
+    today = date(2026, 9, 2)
+    for k, w in enumerate([66.0, 66.2, 66.5, 66.9]):
+        conn.execute(
+            "INSERT INTO body_weight (date, weight_kg, source) VALUES (?, ?, 'chat')",
+            ((date(2026, 8, 10) + timedelta(days=7 * k)).isoformat(), w),
+        )
+    conn.commit()
+    t = a.weight_trend(conn, weeks=6, goal_kg=70.0, deadline=date(2026, 12, 31), today=today)
+    assert t["latest"]["weight_kg"] == 66.9
+    assert t["change_kg"] == 0.9
+    assert t["pace_kg_per_week"] == 0.3
+    assert t["needed_kg_per_week"] > 0 and t["on_track"] is True
+    assert t["days_since_last"] == 2
+    empty = a.weight_trend(conn, weeks=2, today=date(2020, 1, 1))
+    assert empty["latest"]["weight_kg"] == 66.9 and empty["change_kg"] is None
